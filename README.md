@@ -36,7 +36,7 @@ so your config, credentials and hooks apply as usual.
   find the commits that added or removed a piece of text in a file (`git log -S`); Enter /
   Shift+Enter jump between results, loading older history when needed.
 - Right-click a commit: create a branch or a tag, check it out, interactive rebase onto it,
-  cherry-pick, revert, reset the current branch to it (soft / mixed / hard, confirmed), the menu
+  edit its message, cherry-pick, revert, reset the current branch to it (soft / mixed / hard, confirmed), the menu
   of each branch on it, copy the hash, message or branch name. Right-click a branch's pill to get
   check out, fast-forward, merge, rebase and interactive rebase for that branch on top.
 - Compare: Ctrl+click a second commit (or _Compare with…_ in the commit menu, the changes row
@@ -58,6 +58,29 @@ so your config, credentials and hooks apply as usual.
   prune.
 - Stashes: stash (with a message, untracked files included), see what a stash holds, apply, pop,
   drop.
+- Patches: Ctrl+click files in the Changes lists to pick several, then right-click: save the
+  selected, or all, staged / unstaged changes as a patch file (untracked files included); a
+  stash's menu saves what it holds. The icon in the Changes header (or the command palette)
+  applies a patch file: whitespace handling, stage it too, three-way, or in reverse.
+- Dialogs with options instead of one-click actions: _Merge_ (fast-forward / no fast-forward /
+  fast-forward only, squash, no commit, message), _Stash_ (message, untracked files, keep index,
+  only the files you Ctrl+clicked) and a checkout that local changes block offers _stash, switch and
+  reapply_. _Commit & Push_ sits next to the commit button; a commit's menu has _Edit message_,
+  _Save as patch_ and bisect entries.
+- Tools menu (the wrench in the toolbar): _Reflog_ (find a commit again, check it out or branch from
+  it), _Bisect_ (a bar under the toolbar with Good / Bad / Skip / Stop and the steps left; start it
+  from here or from a commit's menu), _Git LFS_ (track patterns, fetch, pull, push, prune, lock,
+  unlock), _Maintenance_ (gc, repack, fsck, commit-graph, prune remote branches, expire the reflog; stashes are kept),
+  _Clean untracked files_ (deletes exactly what its preview lists), _Open repository in_ (editors and IDEs found on the PATH),
+  _External diff and merge tools_ (what a file's _Open in external diff tool_ starts) and _Issue
+  links_.
+- Issue links: `#123`, `ABC-123` and `PREFIX-123` in a commit's message become links; GitHub and
+  GitLab remotes link `#123` to their issues by themselves, other trackers get rules (kept in the
+  repository's git config).
+- Submodules: listed with their checked-out branch or commit, ahead/behind and a dot when they
+  moved or have changes; double-click one to open it in its own tab. Right-click: initialize, update
+  (to the recorded commit or the latest remote one), fetch, deinitialize, open a terminal
+  there. The + adds one.
 - Pull / merge requests of GitHub (through `gh`) or GitLab (through `glab`): list, open in the
   browser, check out, create from a branch.
 - Tags: create (light or annotated, optionally pushed), push, delete locally or on the remote.
@@ -97,7 +120,8 @@ so your config, credentials and hooks apply as usual.
 
 **Toolbar, terminal, app**
 
-- Undo, redo, Fetch, Pull and Push (with incoming / outgoing counts), new branch, stash, terminal,
+- Undo, redo, Fetch, Pull and Push (with incoming / outgoing counts; each opens a dialog with its
+  options, Push with force and force-with-lease), new branch, stash, terminal,
   search, open the folder (Explorer / Finder, your editor), refresh (F5).
 - Background fetch every few minutes (Settings; 0 turns it off).
 - HTTPS sign-in: when a remote wants a username and password (or token) and no credential helper
