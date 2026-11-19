@@ -12,15 +12,21 @@ impl RepoTab {
     /// Where `branch` is pushed: its upstream's remote and branch name, else the default remote
     /// and the same name. `None` without a remote.
     fn push_target(&self, branch: &str) -> Option<(String, String, bool)> {
+        if !super::dialogs::valid_ref_name(branch) {
+            return None;
+        }
         let b = self.refs.local.iter().find(|b| b.name == branch);
         if let Some(b) = b
             && !b.upstream.is_empty()
             && !b.upstream_gone()
             && let Some((remote, name)) = b.upstream.split_once('/')
+            && super::dialogs::valid_ref_name(remote)
+            && super::dialogs::valid_ref_name(name)
         {
             return Some((remote.to_owned(), name.to_owned(), true));
         }
-        Some((self.default_remote()?, branch.to_owned(), false))
+        let remote = self.default_remote()?;
+        super::dialogs::valid_ref_name(&remote).then(|| (remote, branch.to_owned(), false))
     }
 
     /// The confirmation that force-pushes `branch`. By default `--force-with-lease`: git refuses

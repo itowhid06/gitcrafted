@@ -94,7 +94,10 @@ pub struct TabLook {
 
 impl TabLook {
     pub fn icon(&self) -> &str {
-        self.icon.as_deref().unwrap_or(ICONS[0].0)
+        self.icon
+            .as_deref()
+            .filter(|name| ICONS.iter().any(|(known, _)| known == name))
+            .unwrap_or(ICONS[0].0)
     }
 }
 

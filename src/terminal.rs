@@ -4,8 +4,9 @@
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use egui::{
     Color32, Event, FontId, Key, Modifiers, Rect, Sense, Stroke, Ui, pos2,
@@ -36,56 +37,64 @@ impl ShellSpec {
     }
 }
 
-/// The shells installed on this machine, the platform default first.
+/// The shells installed on this machine, the platform default first (cached once).
 pub fn available_shells() -> Vec<ShellSpec> {
-    let mut list = Vec::new();
-    #[cfg(windows)]
-    {
-        list.push(ShellSpec::new(
-            "Windows PowerShell",
-            "powershell.exe",
-            &["-NoLogo"],
-        ));
-        if on_path("pwsh.exe") {
-            list.insert(0, ShellSpec::new("PowerShell 7", "pwsh.exe", &["-NoLogo"]));
-        }
-        list.push(ShellSpec::new("Command Prompt", "cmd.exe", &[]));
-        for dir in [
-            r"C:\Program Files\Git\bin",
-            r"C:\Program Files (x86)\Git\bin",
-        ] {
-            let bash = Path::new(dir).join("bash.exe");
-            if bash.is_file() {
-                let program = bash.display().to_string();
-                list.push(ShellSpec::new("Git Bash", &program, &["--login", "-i"]));
-                break;
+    static SHELLS: OnceLock<Vec<ShellSpec>> = OnceLock::new();
+    SHELLS
+        .get_or_init(|| {
+            let mut list = Vec::new();
+            #[cfg(windows)]
+            {
+                list.push(ShellSpec::new(
+                    "Windows PowerShell",
+                    "powershell.exe",
+                    &["-NoLogo"],
+                ));
+                if on_path("pwsh.exe") {
+                    list.insert(0, ShellSpec::new("PowerShell 7", "pwsh.exe", &["-NoLogo"]));
+                }
+                list.push(ShellSpec::new("Command Prompt", "cmd.exe", &[]));
+                for dir in [
+                    r"C:\Program Files\Git\bin",
+                    r"C:\Program Files (x86)\Git\bin",
+                ] {
+                    let bash = Path::new(dir).join("bash.exe");
+                    if bash.is_file() {
+                        let program = bash.display().to_string();
+                        list.push(ShellSpec::new("Git Bash", &program, &["--login", "-i"]));
+                        break;
+                    }
+                }
+                if on_path("wsl.exe") {
+                    list.push(ShellSpec::new("WSL", "wsl.exe", &[]));
+                }
             }
-        }
-        if on_path("wsl.exe") {
-            list.push(ShellSpec::new("WSL", "wsl.exe", &[]));
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        if let Ok(shell) = std::env::var("SHELL") {
-            let name = Path::new(&shell)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| shell.clone());
-            list.push(ShellSpec::new(&name, &shell, &[]));
-        }
-        for (label, program) in [
-            ("bash", "/bin/bash"),
-            ("zsh", "/bin/zsh"),
-            ("fish", "/usr/bin/fish"),
-            ("sh", "/bin/sh"),
-        ] {
-            if Path::new(program).is_file() && !list.iter().any(|s| s.program == program) {
-                list.push(ShellSpec::new(label, program, &[]));
+            #[cfg(not(windows))]
+            {
+                if let Ok(shell) = std::env::var("SHELL")
+                    && !shell.is_empty()
+                    && Path::new(&shell).is_file()
+                {
+                    let name = Path::new(&shell)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| shell.clone());
+                    list.push(ShellSpec::new(&name, &shell, &[]));
+                }
+                for (label, program) in [
+                    ("bash", "/bin/bash"),
+                    ("zsh", "/bin/zsh"),
+                    ("fish", "/usr/bin/fish"),
+                    ("sh", "/bin/sh"),
+                ] {
+                    if Path::new(program).is_file() && !list.iter().any(|s| s.program == program) {
+                        list.push(ShellSpec::new(label, program, &[]));
+                    }
+                }
             }
-        }
-    }
-    list
+            list
+        })
+        .clone()
 }
 
 /// The shell to start: the one chosen in the settings when installed, else the default.
@@ -101,11 +110,12 @@ pub fn default_shell(ctx: &egui::Context) -> ShellSpec {
 }
 
 pub struct Terminal {
+    id: u64,
     parser: Arc<Mutex<vt100::Parser>>,
-    /// Shared with the reader thread, which answers the shell's cursor-position queries.
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Channel to a dedicated writer thread so neither the UI nor reader thread blocks on PTY writes.
+    writer_tx: Sender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    child: Option<Box<dyn Child + Send + Sync>>,
     exited: Arc<AtomicBool>,
     /// (rows, cols) the pty was last sized to.
     size: (u16, u16),
@@ -121,6 +131,7 @@ pub struct Terminal {
 impl Terminal {
     /// Starts `shell` in `cwd`.
     pub fn spawn(cwd: &Path, shell: &ShellSpec, ctx: &egui::Context) -> Result<Self, String> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let (rows, cols) = (24, 100);
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -139,21 +150,36 @@ impl Terminal {
         if let Some(path) = crate::shell_path::path() {
             cmd.env("PATH", path);
         }
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("could not start {program}: {e}"))?;
         // The child holds its own handle; ours would keep the pty open after it exits.
         drop(pair.slave);
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("terminal: {e}"))?;
-        let writer = Arc::new(Mutex::new(
-            pair.master
-                .take_writer()
-                .map_err(|e| format!("terminal: {e}"))?,
-        ));
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("terminal: {e}"));
+            }
+        };
+        let mut raw_writer = match pair.master.take_writer() {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("terminal: {e}"));
+            }
+        };
+        let (writer_tx, writer_rx) = channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            while let Ok(bytes) = writer_rx.recv() {
+                if raw_writer.write_all(&bytes).is_err() || raw_writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(
             nz(rows),
@@ -164,7 +190,7 @@ impl Terminal {
         {
             let parser = Arc::clone(&parser);
             let exited = Arc::clone(&exited);
-            let writer = Arc::clone(&writer);
+            let writer_tx = writer_tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 16 * 1024];
@@ -173,18 +199,21 @@ impl Terminal {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let bytes = buf.get(..n).unwrap_or_default();
-                            let mut parser = lock(&parser);
-                            parser.process(bytes);
-                            // ConPTY (and some programs) ask where the cursor is and wait for
-                            // the answer before printing anything (DSR 6 → CPR).
-                            if contains(bytes, b"[6n") {
-                                let (row, col) = parser.screen().cursor_position();
-                                let reply = format!("[{};{}R", row + 1, col + 1);
-                                let mut w = lock(&writer);
-                                let _ = w.write_all(reply.as_bytes());
-                                let _ = w.flush();
+                            let dsr_reply = {
+                                let mut parser = lock(&parser);
+                                parser.process(bytes);
+                                // ConPTY (and some programs) ask where the cursor is and wait for
+                                // the answer before printing anything (DSR 6 -> CPR).
+                                if contains(bytes, b"\x1b[6n") {
+                                    let (row, col) = parser.screen().cursor_position();
+                                    Some(format!("\x1b[{};{}R", row + 1, col + 1))
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(reply) = dsr_reply {
+                                let _ = writer_tx.send(reply.into_bytes());
                             }
-                            drop(parser);
                             ctx.request_repaint();
                         }
                     }
@@ -196,10 +225,11 @@ impl Terminal {
 
         let shell = shell.label.clone();
         Ok(Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             parser,
-            writer,
+            writer_tx,
             master: pair.master,
-            child,
+            child: Some(child),
             exited,
             size: (rows, cols),
             scroll: 0,
@@ -208,10 +238,31 @@ impl Terminal {
             shell,
         })
     }
+}
 
+fn sanitized_terminal_font(raw_font: f32) -> f32 {
+    if raw_font.is_finite() {
+        raw_font.clamp(9.0, 20.0)
+    } else {
+        12.5
+    }
+}
+
+fn format_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        let safe = text.replace('\x1b', "");
+        format!("\x1b[200~{safe}\x1b[201~").into_bytes()
+    } else {
+        text.into_bytes()
+    }
+}
+
+impl Terminal {
     pub fn has_exited(&mut self) -> bool {
         if !self.exited.load(Ordering::Relaxed)
-            && let Ok(Some(_)) = self.child.try_wait()
+            && let Some(child) = &mut self.child
+            && let Ok(Some(_)) = child.try_wait()
         {
             // ConPTY doesn't always end the read when the shell exits.
             self.exited.store(true, Ordering::Relaxed);
@@ -223,11 +274,7 @@ impl Terminal {
         if bytes.is_empty() {
             return;
         }
-        {
-            let mut w = lock(&self.writer);
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
-        }
+        let _ = self.writer_tx.send(bytes.to_vec());
         self.selection = None;
         // Typing follows the output again.
         if self.scroll != 0 {
@@ -239,17 +286,36 @@ impl Terminal {
     /// Paints the screen into all of `ui`'s remaining space and handles input.
     pub fn ui(&mut self, ui: &mut Ui) {
         let t = Tokens::get(ui.ctx());
-        let font = theme::mono(crate::settings::Settings::get(ui.ctx()).terminal_font);
+        let font_pt = sanitized_terminal_font(crate::settings::Settings::get(ui.ctx()).terminal_font);
+        let font = theme::mono(font_pt);
         let glyph = ui
             .painter()
             .layout_no_wrap("M".to_owned(), font.clone(), t.text);
         let cell = vec2(glyph.size().x.max(1.0), glyph.size().y.max(1.0));
 
         let rect = ui.available_rect_before_wrap();
-        let id = ui.id().with("terminal");
+        let id = ui.id().with(("terminal", self.id));
         let resp = ui.interact(rect, id, Sense::click_and_drag());
         ui.allocate_rect(rect, Sense::hover());
         let inner = rect.shrink2(vec2(8.0, 6.0));
+
+        // Size the pty to the panel before mapping pointer coordinates or painting.
+        let cols = ((inner.width().max(0.0) / cell.x).floor() as u16).clamp(2, 1000);
+        let rows = ((inner.height().max(0.0) / cell.y).floor() as u16).clamp(1, 500);
+        if (rows, cols) != self.size {
+            self.size = (rows, cols);
+            self.selection = None;
+            let _ = self.master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+            let mut parser = lock(&self.parser);
+            parser.set_size(nz(rows), nz(cols));
+            self.scroll = parser.screen().scrollback();
+        }
+
         let cell_at = |p: egui::Pos2| -> (u16, u16) {
             let col = ((p.x - inner.left()) / cell.x).floor().max(0.0) as u16;
             let row = ((p.y - inner.top()) / cell.y).floor().max(0.0) as u16;
@@ -294,20 +360,6 @@ impl Terminal {
             });
         }
 
-        // Size the pty to the panel.
-        let cols = ((inner.width() / cell.x).floor() as u16).clamp(2, 1000);
-        let rows = ((inner.height() / cell.y).floor() as u16).clamp(1, 500);
-        if (rows, cols) != self.size {
-            self.size = (rows, cols);
-            let _ = self.master.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
-            lock(&self.parser).set_size(nz(rows), nz(cols));
-        }
-
         // Input.
         if focused {
             let (events, app_cursor, bracketed) = {
@@ -323,17 +375,13 @@ impl Terminal {
                 match event {
                     Event::Text(text) => self.send(text.as_bytes()),
                     Event::Paste(text) => {
-                        let text = text.replace("\r\n", "\r").replace('\n', "\r");
-                        if bracketed {
-                            self.send(format!("\x1b[200~{text}\x1b[201~").as_bytes());
-                        } else {
-                            self.send(text.as_bytes());
-                        }
+                        let bytes = format_paste(&text, bracketed);
+                        self.send(&bytes);
                     }
                     // egui turns Ctrl+C / Ctrl+X into clipboard events: copy a selection,
-                    // otherwise the shell gets them.
+                    // otherwise on non-macOS the shell gets SIGINT.
                     Event::Copy => {
-                        if !self.copy_selection(ui.ctx()) {
+                        if !self.copy_selection(ui.ctx()) && !cfg!(target_os = "macos") {
                             self.send(b"\x03");
                         }
                     }
@@ -344,7 +392,8 @@ impl Terminal {
                         modifiers,
                         ..
                     } => {
-                        if key == Key::C && modifiers.ctrl && modifiers.shift {
+                        if key == Key::C && (modifiers.ctrl || modifiers.mac_cmd) && modifiers.shift
+                        {
                             self.copy_selection(ui.ctx());
                         } else if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
                             self.send(&bytes);
@@ -374,6 +423,7 @@ impl Terminal {
         painter.rect_filled(rect, 0.0, t.field);
         let parser = lock(&self.parser);
         let screen = parser.screen();
+        self.scroll = screen.scrollback();
         let (rows, cols) = screen.size();
         let (rows, cols) = (rows.get(), cols.get());
         let palette = Palette::new(&t);
@@ -387,8 +437,8 @@ impl Terminal {
                 && row >= r0
                 && row <= r1
             {
-                let from = if row == r0 { c0 } else { 0 };
-                let to = if row == r1 { c1 } else { cols };
+                let from = if row == r0 { c0.min(cols) } else { 0 };
+                let to = if row == r1 { c1.min(cols) } else { cols };
                 if to > from {
                     painter.rect_filled(
                         Rect::from_min_size(
@@ -437,7 +487,6 @@ impl Terminal {
                 col += 1;
             }
             let galley = ui.fonts_mut(|f| f.layout_job(job));
-            let _ = selected;
             painter.galley(pos2(inner.left(), y), galley, t.text);
         }
 
@@ -474,22 +523,42 @@ impl Terminal {
     }
 }
 
+fn selection_text_clamped(
+    screen: &vt100::Screen,
+    a: (u16, u16),
+    b: (u16, u16),
+) -> Option<String> {
+    let (rows, cols) = screen.size();
+    let max_row = rows.get().saturating_sub(1);
+    let max_col = cols.get();
+    let a = (a.0.min(max_row), a.1.min(max_col));
+    let b = (b.0.min(max_row), b.1.min(max_col));
+    let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
+    if (r0, c0) >= (r1, c1) {
+        return None;
+    }
+    let text = screen.contents_between(r0, c0, r1, c1);
+    Some(
+        text.lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 impl Terminal {
     /// Copies the selected text; false when nothing is selected.
     fn copy_selection(&mut self, ctx: &egui::Context) -> bool {
         let Some((a, b)) = self.selection else {
             return false;
         };
-        let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
-        if (r0, c0) == (r1, c1) {
+        let parser = lock(&self.parser);
+        let copied = selection_text_clamped(parser.screen(), a, b);
+        drop(parser);
+        let Some(text) = copied else {
+            self.selection = None;
             return false;
-        }
-        let text = lock(&self.parser).screen().contents_between(r0, c0, r1, c1);
-        let text = text
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
+        };
         ctx.copy_text(text);
         self.selection = None;
         true
@@ -498,7 +567,12 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if let Some(mut child) = self.child.take() {
+            std::thread::spawn(move || {
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -572,6 +646,7 @@ fn key_bytes(key: Key, mods: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
 /// Terminal colours tuned to the app theme.
 struct Palette {
     fg: Color32,
+    default_bg: Color32,
     ansi: [Color32; 16],
 }
 
@@ -616,7 +691,11 @@ impl Palette {
                 Color32::from_rgb(40, 40, 40),
             ]
         };
-        Self { fg: t.text, ansi }
+        Self {
+            fg: t.text,
+            default_bg: t.field,
+            ansi,
+        }
     }
 
     fn color(&self, c: vt100::Color) -> Option<Color32> {
@@ -655,7 +734,7 @@ impl Palette {
         }
         if cell.inverse() {
             let old_fg = fg;
-            fg = bg.unwrap_or(Color32::from_rgb(30, 30, 30));
+            fg = bg.unwrap_or(self.default_bg);
             bg = Some(old_fg);
         }
         (fg, bg)
@@ -699,5 +778,31 @@ mod tests {
             p.color(vt100::Color::Idx(255)),
             Some(Color32::from_gray(238))
         );
+    }
+
+    #[test]
+    fn selection_copy_is_safe_after_terminal_shrinks() {
+        let mut parser = vt100::Parser::new(nz(20), nz(80), 0);
+        parser.process(b"hello world");
+        parser.set_size(nz(4), nz(10));
+        // Previously out-of-bounds coordinates after shrink clamp safely instead of panicking.
+        assert_eq!(selection_text_clamped(parser.screen(), (18, 70), (19, 75)), None);
+        assert_eq!(
+            selection_text_clamped(parser.screen(), (0, 0), (0, 50)).as_deref(),
+            Some("hello worl")
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_strips_escape_sequences_and_sanitizes_font() {
+        let bytes = format_paste("echo ok\x1b[201~; rm -rf /\n", true);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("\x1b[200~"));
+        assert!(text.ends_with("\x1b[201~"));
+        let middle = &text["\x1b[200~".len()..text.len() - "\x1b[201~".len()];
+        assert!(!middle.contains('\x1b'));
+        assert_eq!(sanitized_terminal_font(f32::NAN), 12.5);
+        assert_eq!(sanitized_terminal_font(2.0), 9.0);
+        assert_eq!(sanitized_terminal_font(99.0), 20.0);
     }
 }

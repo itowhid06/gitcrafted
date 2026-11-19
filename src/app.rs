@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use egui::{Align2, Key, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,12 @@ struct CloneForm {
     password: String,
 }
 
+enum PickTarget {
+    OpenExisting,
+    CreateNew,
+    CloneParent,
+}
+
 pub struct App {
     git_version: Result<String, String>,
     tabs: Vec<Tab>,
@@ -77,6 +83,10 @@ pub struct App {
     cloning: Option<(PathBuf, Receiver<Result<(), String>>)>,
     /// The form of the running clone, back on screen if it needs credentials.
     cloning_form: Option<CloneForm>,
+    /// A non-blocking native folder chooser currently open.
+    file_picker: Option<(PickTarget, crate::file_dialog::PendingDialog)>,
+    /// Cached desktop-entry target/installed status for the Home link.
+    desktop_cache: Option<(std::time::Instant, Option<PathBuf>, bool)>,
     /// A newer release than this build.
     update: Option<update::Release>,
     update_rx: Option<Receiver<Result<update::Release, String>>>,
@@ -135,10 +145,11 @@ enum Entry {
 impl App {
     /// `open_arg`: a repository passed on the command line, opened (or focused) on start.
     pub fn new(cc: &eframe::CreationContext<'_>, open_arg: Option<PathBuf>) -> Self {
-        let saved: Saved = cc
+        let mut saved: Saved = cc
             .storage
             .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
             .unwrap_or_default();
+        saved.settings.sanitize();
         let ctx = &cc.egui_ctx;
         egui_extras::install_image_loaders(ctx);
         theme::install_fonts(ctx);
@@ -162,13 +173,17 @@ impl App {
             clone_form: None,
             cloning: None,
             cloning_form: None,
+            file_picker: None,
+            desktop_cache: None,
             update: None,
             update_rx: None,
             update_checked: saved.update_checked,
             skipped_version: saved.skipped_version,
             tab_looks: saved.tab_looks,
         };
-        if saved.settings.check_updates && git::now() - saved.update_checked > update::INTERVAL {
+        if saved.settings.check_updates
+            && git::now().saturating_sub(saved.update_checked) > update::INTERVAL
+        {
             let (tx, rx) = channel();
             let ctx2 = ctx.clone();
             std::thread::spawn(move || {
@@ -191,23 +206,23 @@ impl App {
         if let Some(path) = open_arg
             && app.git_version.is_ok()
         {
-            app.open_repo(&path, ctx);
+            let _ = app.open_repo(&path, ctx);
         }
         app
     }
 
     /// Opens `path` as the start page's "Open" button does (for `examples/ui_shot.rs`).
     pub fn open_tab(&mut self, path: &Path, ctx: &egui::Context) {
-        self.open_repo(path, ctx);
+        let _ = self.open_repo(path, ctx);
     }
 
     /// Opens `path` in the active tab if it's a start page, otherwise in a new tab.
-    fn open_repo(&mut self, path: &Path, ctx: &egui::Context) {
+    fn open_repo(&mut self, path: &Path, ctx: &egui::Context) -> Option<PathBuf> {
         let root = match git::toplevel(path) {
             Ok(root) => root,
             Err(e) => {
                 self.error = Some(e);
-                return;
+                return None;
             }
         };
         let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -221,15 +236,16 @@ impl App {
             .position(|t| matches!(t, Tab::Repo(r) if r.path == root))
         {
             self.active = i;
-            return;
+            return Some(root);
         }
-        let tab = Tab::Repo(Box::new(RepoTab::new(root, ctx)));
+        let tab = Tab::Repo(Box::new(RepoTab::new(root.clone(), ctx)));
         if matches!(self.tabs.get(self.active), Some(Tab::Home)) {
             self.tabs[self.active] = tab;
         } else {
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
         }
+        Some(root)
     }
 
     fn remember(&mut self, path: &Path) {
@@ -239,35 +255,75 @@ impl App {
     }
 
     fn pick_existing(&mut self, ctx: &egui::Context) {
-        if let Some(dir) = rfd::FileDialog::new()
-            .set_title("Open a git repository")
-            .pick_folder()
-        {
-            self.open_repo(&dir, ctx);
+        if self.file_picker.is_some() {
+            return;
         }
+        let dialog = rfd::AsyncFileDialog::new().set_title("Open a git repository");
+        self.file_picker = Some((
+            PickTarget::OpenExisting,
+            crate::file_dialog::PendingDialog::pick_folder(dialog, ctx),
+        ));
     }
 
     fn pick_new(&mut self, ctx: &egui::Context) {
-        let Some(dir) = rfd::FileDialog::new()
-            .set_title("Choose a folder for the new repository")
-            .pick_folder()
-        else {
-            return;
-        };
-        // Already the root of a repository: just open it rather than re-initialising.
-        if let Ok(root) = git::toplevel(&dir)
-            && same_path(&root, &dir)
-        {
-            self.open_repo(&dir, ctx);
+        if self.file_picker.is_some() {
             return;
         }
-        match git::init(&dir) {
-            Ok(()) => self.open_repo(&dir, ctx),
-            Err(e) => self.error = Some(format!("git init failed: {e}")),
+        let dialog =
+            rfd::AsyncFileDialog::new().set_title("Choose a folder for the new repository");
+        self.file_picker = Some((
+            PickTarget::CreateNew,
+            crate::file_dialog::PendingDialog::pick_folder(dialog, ctx),
+        ));
+    }
+
+    fn poll_file_picker(&mut self, ctx: &egui::Context) {
+        let Some((target, picker)) = &mut self.file_picker else {
+            return;
+        };
+        let Some(choice) = picker.poll() else {
+            return;
+        };
+        let target = match target {
+            PickTarget::OpenExisting => PickTarget::OpenExisting,
+            PickTarget::CreateNew => PickTarget::CreateNew,
+            PickTarget::CloneParent => PickTarget::CloneParent,
+        };
+        self.file_picker = None;
+        let Some(dir) = choice else {
+            return;
+        };
+        match target {
+            PickTarget::OpenExisting => {
+                let _ = self.open_repo(&dir, ctx);
+            }
+            PickTarget::CreateNew => {
+                if let Ok(root) = git::toplevel(&dir)
+                    && same_path(&root, &dir)
+                {
+                    let _ = self.open_repo(&dir, ctx);
+                    return;
+                }
+                match git::init(&dir) {
+                    Ok(()) => {
+                        let _ = self.open_repo(&dir, ctx);
+                    }
+                    Err(e) => self.error = Some(format!("git init failed: {e}")),
+                }
+            }
+            PickTarget::CloneParent => {
+                if let Some(form) = &mut self.clone_form {
+                    form.parent = dir.display().to_string();
+                }
+            }
         }
     }
 
     fn start_clone(&mut self) {
+        if self.cloning.is_some() {
+            self.error = Some("A clone is already running.".to_owned());
+            return;
+        }
         let parent = self
             .clone_parent
             .clone()
@@ -297,6 +353,7 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
+        self.tab_drag = None;
         self.tabs.remove(i);
         if self.tabs.is_empty() {
             self.tabs.push(Tab::Home);
@@ -349,8 +406,12 @@ impl App {
             ui.spacing_mut().item_spacing.x = GAP;
             let ctx = ui.ctx().clone();
             let n = self.tabs.len();
+            // Reserve room for the `+` button and right-side bar buttons so tabs never push them off-screen.
+            let right_reserve =
+                34.0 + 34.0 * 4.0 + if self.update.is_some() { 112.0 } else { 0.0 } + 16.0;
+            let max_strip = (ui.available_width() - right_reserve).max(96.0);
             // Each tab's title and width.
-            let titles: Vec<_> = self
+            let mut titles: Vec<_> = self
                 .tabs
                 .iter()
                 .enumerate()
@@ -372,9 +433,18 @@ impl App {
                     (galley, color, w)
                 })
                 .collect();
+            let natural_total: f32 =
+                (titles.iter().map(|g| g.2 + GAP).sum::<f32>() - GAP).max(0.0);
+            if natural_total > max_strip && n > 0 {
+                let scale = max_strip / natural_total;
+                let min_w = (max_strip / n as f32).clamp(48.0, 110.0);
+                for item in &mut titles {
+                    item.2 = (item.2 * scale).max(min_w);
+                }
+            }
             let width = |i: usize| titles.get(i).map_or(0.0, |g| g.2);
-            let total: f32 = titles.iter().map(|g| g.2 + GAP).sum::<f32>() - GAP;
-            let (strip, _) = ui.allocate_exact_size(vec2(total.max(0.0), TAB_H), Sense::hover());
+            let total: f32 = (titles.iter().map(|g| g.2 + GAP).sum::<f32>() - GAP).max(0.0);
+            let (strip, _) = ui.allocate_exact_size(vec2(total, TAB_H), Sense::hover());
 
             // The dragged tab follows the pointer; the slot it would drop into is where its
             // middle is among the others.
@@ -496,7 +566,7 @@ impl App {
                 );
                 let text_clip = Rect::from_min_max(
                     pos2(rect.left() + 32.0, rect.top()),
-                    pos2(rect.right() - 28.0, rect.bottom()),
+                    pos2((rect.right() - 28.0).max(rect.left() + 32.0), rect.bottom()),
                 );
                 ui.painter().with_clip_rect(text_clip).galley(
                     pos2(text_clip.left(), y - galley.size().y / 2.0),
@@ -508,7 +578,8 @@ impl App {
                     Rect::from_center_size(pos2(rect.right() - 15.0, y), vec2(18.0, 18.0));
                 if busy {
                     egui::Spinner::new().size(11.0).paint_at(ui, close_rect);
-                } else if active || hovered {
+                } else if active || hovered || (dragging.is_none() && ui.rect_contains_pointer(rect))
+                {
                     let c = ui.interact(close_rect, resp.id.with("close"), Sense::click());
                     if c.hovered() {
                         ui.painter().rect_filled(close_rect, t.radius_sm, t.pressed);
@@ -570,7 +641,11 @@ impl App {
                     self.open_settings();
                 }
                 if icons::bar_button(ui, "command", "Command palette (Ctrl+P)").clicked() {
-                    self.open_palette();
+                    if self.palette.is_some() {
+                        self.palette = None;
+                    } else {
+                        self.open_palette();
+                    }
                 }
                 let resp = icons::bar_button(ui, "palette", "Theme");
                 egui::Popup::menu(&resp)
@@ -682,8 +757,22 @@ impl App {
                             ui.label(RichText::new(v).color(t.text_dim));
                         });
                     }
-                    if let Some(exe) = crate::desktop_entry::target()
-                        && !crate::desktop_entry::installed()
+                    let (desk_target, desk_installed) = match &self.desktop_cache {
+                        Some((when, target, installed))
+                            if when.elapsed() < std::time::Duration::from_secs(3) =>
+                        {
+                            (target.clone(), *installed)
+                        }
+                        _ => {
+                            let target = crate::desktop_entry::target();
+                            let installed = crate::desktop_entry::installed();
+                            self.desktop_cache =
+                                Some((std::time::Instant::now(), target.clone(), installed));
+                            (target, installed)
+                        }
+                    };
+                    if let Some(exe) = desk_target
+                        && !desk_installed
                     {
                         ui.add_space(4.0);
                         let link = ui
@@ -691,13 +780,14 @@ impl App {
                             .on_hover_text(exe.display().to_string());
                         if link.clicked() {
                             self.error = crate::desktop_entry::install(&exe).err();
+                            self.desktop_cache = None;
                         }
                     }
                     ui.add_space(26.0);
 
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        let w = (ui.available_width() - 24.0) / 3.0;
+                        let w = ((ui.available_width() - 24.0) / 3.0).max(60.0);
                         for (i, (icon, title, sub)) in [
                             ("folder-open", "Open", "An existing local repository"),
                             ("folder-plus", "Create", "A new repository (git init)"),
@@ -773,11 +863,13 @@ impl App {
             .shadow(ctx.global_style().visuals.window_shadow);
         let mut submit = false;
         let mut cancel = false;
+        let modal_w = (ctx.content_rect().width() - 32.0).clamp(260.0, 460.0);
+        let mut browse_clicked = false;
         let resp = egui::Modal::new(egui::Id::new("clone-dialog"))
             .frame(frame)
             .backdrop_color(egui::Color32::from_black_alpha(110))
             .show(ctx, |ui| {
-                ui.set_width(460.0);
+                ui.set_width(modal_w);
                 ui.label(RichText::new("Clone repository").font(theme::semibold(15.0)));
                 ui.add_space(10.0);
                 ui.label(RichText::new("URL").color(t.text_dim).small());
@@ -799,16 +891,14 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut form.parent)
-                            .desired_width(ui.available_width() - 90.0)
+                            .desired_width((ui.available_width() - 90.0).max(80.0))
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
                     if ui
                         .add(egui::Button::new("Browse…").min_size(vec2(80.0, 28.0)))
                         .clicked()
-                        && let Some(dir) =
-                            rfd::FileDialog::new().set_title("Clone into").pick_folder()
                     {
-                        form.parent = dir.display().to_string();
+                        browse_clicked = true;
                     }
                 });
                 ui.add_space(6.0);
@@ -823,7 +913,13 @@ impl App {
                 {
                     form.name_edited = true;
                 }
-                let dest = PathBuf::from(form.parent.trim()).join(form.name.trim());
+                let trimmed_name = form.name.trim();
+                let safe_name = !trimmed_name.is_empty()
+                    && trimmed_name != "."
+                    && trimmed_name != ".."
+                    && !trimmed_name.contains(['/', '\\'])
+                    && !Path::new(trimmed_name).is_absolute();
+                let dest = PathBuf::from(form.parent.trim()).join(trimmed_name);
                 ui.label(
                     RichText::new(dest.display().to_string())
                         .color(t.text_faint)
@@ -851,33 +947,48 @@ impl App {
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
                 }
+                if !trimmed_name.is_empty() && !safe_name {
+                    ui.colored_label(
+                        t.danger,
+                        "Folder name cannot be `.` or `..` or contain path separators.",
+                    );
+                }
                 if let Some(err) = &form.error {
                     ui.colored_label(t.danger, err);
                 }
                 ui.add_space(12.0);
-                let valid = !form.url.trim().is_empty()
-                    && !form.parent.trim().is_empty()
-                    && !form.name.trim().is_empty();
+                let valid =
+                    !form.url.trim().is_empty() && !form.parent.trim().is_empty() && safe_name;
                 ui.horizontal(|ui| {
                     let enter = ui.input(|i| i.key_pressed(Key::Enter));
-                    if crate::repo::primary_button(ui, "Clone", valid, 90.0).clicked()
-                        || (enter && valid)
-                    {
-                        submit = true;
-                    }
-                    if ui
-                        .add(egui::Button::new("Cancel").min_size(vec2(80.0, 30.0)))
-                        .clicked()
-                    {
+                    let clone_btn = crate::repo::primary_button(ui, "Clone", valid, 90.0);
+                    let cancel_btn =
+                        ui.add(egui::Button::new("Cancel").min_size(vec2(80.0, 30.0)));
+                    if cancel_btn.clicked() {
                         cancel = true;
+                    } else if clone_btn.clicked() || (enter && valid && !cancel_btn.has_focus()) {
+                        submit = true;
                     }
                 });
             });
         if resp.should_close() {
             cancel = true;
         }
+        if browse_clicked && self.file_picker.is_none() {
+            let dialog = rfd::AsyncFileDialog::new().set_title("Clone into");
+            self.file_picker = Some((
+                PickTarget::CloneParent,
+                crate::file_dialog::PendingDialog::pick_folder(dialog, ctx),
+            ));
+        }
 
-        if submit {
+        if cancel {
+            self.clone_form = None;
+        } else if submit {
+            if self.cloning.is_some() {
+                form.error = Some("Another clone is already running.".to_owned());
+                return;
+            }
             let dest = PathBuf::from(form.parent.trim()).join(form.name.trim());
             let occupied = dest.exists()
                 && std::fs::read_dir(&dest)
@@ -903,14 +1014,19 @@ impl App {
             self.cloning = Some((dest, rx));
             self.cloning_form = self.clone_form.take();
             self.error = None;
-        } else if cancel {
-            self.clone_form = None;
         }
     }
 
     fn poll_update(&mut self) {
         let Some(rx) = &self.update_rx else { return };
-        let Ok(result) = rx.try_recv() else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.update_rx = None;
+                return;
+            }
+        };
         self.update_rx = None;
         // A failed check (offline…) is tried again next start.
         if let Ok(release) = result {
@@ -927,21 +1043,34 @@ impl App {
         let Some((dest, rx)) = &self.cloning else {
             return;
         };
-        let Ok(result) = rx.try_recv() else { return };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("clone worker stopped unexpectedly".to_owned()),
+        };
         let dest = dest.clone();
         self.cloning = None;
         match result {
             Ok(()) => {
                 // Show it in a start page tab if one is active, otherwise in a new tab.
-                self.open_repo(&dest, ctx);
-                // The credentials that cloned it also fetch and push in its tab.
-                if let Some(form) = self.cloning_form.take().filter(|f| f.auth)
-                    && let Some(Tab::Repo(repo)) = self.tabs.get_mut(self.active)
+                if let Some(opened_root) = self.open_repo(&dest, ctx)
+                    && let Some(form) = self
+                        .cloning_form
+                        .take()
+                        .filter(|f| f.auth && !f.username.trim().is_empty())
+                    && let Some(Tab::Repo(repo)) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| matches!(t, Tab::Repo(r) if r.path == opened_root))
                 {
-                    repo.set_credentials(git::Credentials {
-                        username: form.username.trim().to_owned(),
-                        password: form.password,
-                    });
+                    // The credentials that cloned it also fetch and push in its tab.
+                    repo.set_credentials(
+                        &form.url,
+                        git::Credentials {
+                            username: form.username.trim().to_owned(),
+                            password: form.password,
+                        },
+                    );
                 }
             }
             // Back to the form, asking for credentials.
@@ -1008,15 +1137,20 @@ impl eframe::App for App {
                 .show(ui, |ui| self.git_missing(ui, &err));
             return;
         }
+        self.poll_file_picker(&ctx);
         self.poll_clone(&ctx);
         self.poll_update();
 
         // Shortcuts.
-        // A focused text field or the terminal keeps these keys for itself.
+        // A focused text field, the terminal, or any open dialog keeps these keys for itself.
+        let repo_dialog =
+            matches!(self.tabs.get(self.active), Some(Tab::Repo(r)) if r.has_dialog());
         let modal_open = self.clone_form.is_some()
             || self.palette.is_some()
             || self.manual_open
+            || repo_dialog
             || ctx.egui_wants_keyboard_input();
+        let wants_kb = ctx.egui_wants_keyboard_input();
         let (new_tab, close, refresh, focused, palette, manual) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::T),
@@ -1027,13 +1161,17 @@ impl eframe::App for App {
                 i.key_pressed(Key::F1),
             )
         });
-        if manual && self.clone_form.is_none() && self.palette.is_none() {
+        if manual
+            && self.clone_form.is_none()
+            && self.palette.is_none()
+            && (self.manual_open || (!repo_dialog && !wants_kb))
+        {
             self.manual_open = !self.manual_open;
         }
         if palette && self.clone_form.is_none() {
             if self.palette.is_some() {
                 self.palette = None;
-            } else {
+            } else if !self.manual_open && !repo_dialog && !wants_kb {
                 self.open_palette();
             }
         }
@@ -1079,10 +1217,11 @@ impl eframe::App for App {
             Some(Tab::Repo(repo)) => {
                 repo.keys_blocked =
                     self.palette.is_some() || self.manual_open || self.clone_form.is_some();
-                repo.ui(ui);
+                let tab_id = repo.path.clone();
+                ui.push_id(tab_id, |ui| repo.ui(ui));
                 // A worktree asked to be opened in its own tab.
                 if let Some(path) = repo.open_request.take() {
-                    self.open_repo(&path, &ctx);
+                    let _ = self.open_repo(&path, &ctx);
                 }
             }
             Some(Tab::Settings) => {
@@ -1233,7 +1372,8 @@ fn recent_row(ui: &mut Ui, path: &Path) -> Option<RecentClick> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     // Leave room for the remove button; long paths are cut at the row's edge.
-    let p = ui.painter_at(rect.with_max_x(rect.right() - 36.0));
+    let clip_right = (rect.right() - 36.0).max(rect.left());
+    let p = ui.painter_at(rect.with_max_x(clip_right));
     p.text(
         pos2(rect.left() + 40.0, y - 8.0),
         Align2::LEFT_CENTER,
@@ -1400,6 +1540,20 @@ impl App {
         }
         let mut run = None;
         let mut close = esc;
+        let screen = ctx.content_rect();
+        let backdrop = egui::Area::new(egui::Id::new("palette-backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let r = ui.allocate_response(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(60));
+                r
+            });
+        if backdrop.inner.clicked() {
+            close = true;
+        }
+        let palette_w = (screen.width() - 32.0).clamp(260.0, 560.0);
         let frame = egui::Frame::new()
             .fill(t.card)
             .stroke(Stroke::new(1.0, t.field_border))
@@ -1409,9 +1563,9 @@ impl App {
         let area = egui::Area::new(egui::Id::new("palette"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0));
-        let resp = area.show(ctx, |ui| {
+        area.show(ctx, |ui| {
             frame.show(ui, |ui| {
-                ui.set_width(560.0);
+                ui.set_width(palette_w);
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut palette.query)
                         .hint_text("Type a command or a branch…")
@@ -1427,7 +1581,7 @@ impl App {
                 }
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
-                    .max_height(380.0)
+                    .max_height((screen.height() - 160.0).clamp(140.0, 380.0))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for (k, &i) in shown.iter().enumerate() {
@@ -1444,19 +1598,24 @@ impl App {
                             } else if r.hovered() {
                                 ui.painter().rect_filled(rect, t.radius_sm, t.hover);
                             }
-                            ui.painter().text(
-                                pos2(rect.left() + 10.0, rect.center().y),
-                                Align2::LEFT_CENTER,
-                                label,
-                                egui::FontId::proportional(13.0),
-                                t.text,
-                            );
-                            ui.painter().text(
+                            let hint_rect = ui.painter().text(
                                 pos2(rect.right() - 10.0, rect.center().y),
                                 Align2::RIGHT_CENTER,
                                 hint,
                                 egui::FontId::proportional(11.0),
                                 t.text_faint,
+                            );
+                            let label_max_x = (hint_rect.left() - 12.0).max(rect.left() + 10.0);
+                            let label_clip = Rect::from_min_max(
+                                rect.min,
+                                pos2(label_max_x, rect.bottom()),
+                            );
+                            ui.painter().with_clip_rect(label_clip).text(
+                                pos2(rect.left() + 10.0, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                label,
+                                egui::FontId::proportional(13.0),
+                                t.text,
                             );
                             if r.clicked() {
                                 run = Some(i);
@@ -1470,12 +1629,6 @@ impl App {
         });
         if enter && let Some(&i) = shown.get(palette.selected) {
             run = Some(i);
-        }
-        if resp.response.clicked_elsewhere()
-            && ctx.input(|i| i.pointer.any_pressed())
-            && run.is_none()
-        {
-            close = true;
         }
         if close || run.is_some() {
             self.palette = None;
@@ -1507,7 +1660,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add_space(side);
                     ui.vertical(|ui| {
-                        ui.set_width(WIDTH.min(ui.available_width() - 24.0));
+                        ui.set_width(WIDTH.min((ui.available_width() - 24.0).max(120.0)));
                         ui.add_space(32.0);
                         ui.label(RichText::new("Settings").font(theme::semibold(22.0)));
                         ui.add_space(4.0);
@@ -1525,6 +1678,7 @@ impl App {
             return;
         }
         let t = Tokens::get(ctx);
+        let modal_w = (ctx.content_rect().width() - 32.0).clamp(260.0, 640.0);
         let frame = egui::Frame::new()
             .fill(t.card)
             .stroke(Stroke::new(1.0, t.field_border))
@@ -1536,7 +1690,7 @@ impl App {
             .frame(frame)
             .backdrop_color(egui::Color32::from_black_alpha(110))
             .show(ctx, |ui| {
-                ui.set_width(640.0);
+                ui.set_width(modal_w);
                 ui.horizontal(|ui| {
                     logo(ui, 24.0);
                     ui.label(RichText::new("Manual").font(theme::semibold(16.0)));

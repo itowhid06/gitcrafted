@@ -76,8 +76,12 @@ impl RepoTab {
             return;
         }
 
-        // Keyboard navigation (only when no text field has focus).
-        if !ui.ctx().egui_wants_keyboard_input() && self.dialog.is_none() {
+        // Keyboard navigation (only when no modal, popup, or text field has focus).
+        if !self.keys_blocked
+            && self.dialog.is_none()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && !egui::Popup::is_any_open(ui.ctx())
+        {
             let (up, down) =
                 ui.input(|i| (i.key_pressed(Key::ArrowUp), i.key_pressed(Key::ArrowDown)));
             let current = self.selected.unwrap_or(0);
@@ -96,8 +100,13 @@ impl RepoTab {
 
         let settings = Settings::get(ui.ctx());
         let lanes = self.graph.width.clamp(1, MAX_LANES_SHOWN);
+        let refs_w = if settings.refs_width.is_finite() {
+            settings.refs_width.clamp(150.0, 600.0)
+        } else {
+            270.0
+        };
         let cols = Cols {
-            refs: settings.refs_width.clamp(150.0, 600.0),
+            refs: refs_w,
             graph: (lanes as f32 * LANE_W + 12.0).max(60.0),
             hash: if settings.show_hash { HASH_W } else { 0.0 },
             author: if settings.show_author { AUTHOR_W } else { 0.0 },
@@ -208,7 +217,7 @@ impl RepoTab {
                                 .add_enabled(idle, egui::Button::new("Stash changes…"))
                                 .clicked()
                             {
-                                acts.push(Action::Dialog(Dialog::stash()));
+                                acts.push(Action::Dialog(self.stash_dialog()));
                             }
                         });
                     continue;
@@ -451,9 +460,14 @@ impl RepoTab {
             )
             .clicked()
         {
+            let step: Vec<&str> = if commit.parents.len() > 1 {
+                vec!["cherry-pick", "-m", "1", &hash]
+            } else {
+                vec!["cherry-pick", &hash]
+            };
             acts.push(Action::UndoableOps {
                 label: format!("Cherry-pick {short}"),
-                ops: ops(&[&["cherry-pick", &hash]]),
+                ops: ops(&[&step]),
                 refresh: Refresh::All,
                 undo: Undo::HeadMove { mode: "--keep" },
             });
@@ -462,9 +476,14 @@ impl RepoTab {
             .add_enabled(idle, egui::Button::new("Revert commit"))
             .clicked()
         {
+            let step: Vec<&str> = if commit.parents.len() > 1 {
+                vec!["revert", "--no-edit", "-m", "1", &hash]
+            } else {
+                vec!["revert", "--no-edit", &hash]
+            };
             acts.push(Action::UndoableOps {
                 label: format!("Revert {short}"),
-                ops: ops(&[&["revert", "--no-edit", &hash]]),
+                ops: ops(&[&step]),
                 refresh: Refresh::All,
                 undo: Undo::HeadMove { mode: "--keep" },
             });
@@ -652,7 +671,7 @@ impl RepoTab {
                             } else {
                                 "Search messages, authors and hashes in all history"
                             })
-                            .desired_width(ui.available_width() - 290.0)
+                            .desired_width((ui.available_width() - 290.0).max(120.0))
                             .margin(egui::Margin::symmetric(8, 4)),
                     );
                     // Where to look: commit messages or the code they changed.
@@ -964,8 +983,12 @@ impl RepoTab {
         let text_right = rect.right() - cols.trailing() - 10.0;
 
         if is_wip {
+            let wip_clip = painter.with_clip_rect(Rect::from_min_max(
+                pos2(x, rect.top()),
+                pos2((rect.right() - 8.0).max(x), rect.bottom()),
+            ));
             let font = theme::medium(12.5);
-            let r = painter.text(
+            let r = wip_clip.text(
                 pos2(x, mid),
                 Align2::LEFT_CENTER,
                 "Uncommitted changes",
@@ -984,7 +1007,7 @@ impl RepoTab {
                 (self.work.unstaged.len(), "unstaged", t.warning),
             ] {
                 if n > 0 {
-                    x += pill(&painter, pos2(x, mid), &format!("{n} {label}"), color) + 6.0;
+                    x += pill(&wip_clip, pos2(x, mid), &format!("{n} {label}"), color) + 6.0;
                 }
             }
             return resp;
@@ -996,36 +1019,43 @@ impl RepoTab {
             FontId::proportional(12.5)
         };
         // The summary, then the rest of the message faded, cut with an ellipsis.
-        let text_clip = painter.with_clip_rect(Rect::from_min_max(
-            pos2(x, rect.top()),
-            pos2(text_right, rect.bottom()),
-        ));
-        let summary = text_clip.text(
-            pos2(x + 2.0, mid),
-            Align2::LEFT_CENTER,
-            &commit.summary,
-            font.clone(),
-            t.text,
-        );
-        let room = text_right - summary.right() - 12.0;
-        if !commit.body.is_empty() && room > 24.0 {
-            let mut job = egui::text::LayoutJob::single_section(
-                commit.body.clone(),
-                egui::TextFormat::simple(FontId::proportional(12.5), t.text.gamma_multiply(0.5)),
-            );
-            job.wrap = egui::text::TextWrapping::truncate_at_width(room);
-            let galley = ui.fonts_mut(|f| f.layout_job(job));
-            text_clip.galley(
-                pos2(summary.right() + 10.0, mid - galley.size().y / 2.0),
-                galley,
+        if text_right > x + 4.0 {
+            let text_clip = painter.with_clip_rect(Rect::from_min_max(
+                pos2(x, rect.top()),
+                pos2(text_right, rect.bottom()),
+            ));
+            let summary = text_clip.text(
+                pos2(x + 2.0, mid),
+                Align2::LEFT_CENTER,
+                &commit.summary,
+                font.clone(),
                 t.text,
             );
+            let room = text_right - summary.right() - 12.0;
+            if !commit.body.is_empty() && room > 24.0 {
+                let mut job = egui::text::LayoutJob::single_section(
+                    commit.body.clone(),
+                    egui::TextFormat::simple(FontId::proportional(12.5), t.text.gamma_multiply(0.5)),
+                );
+                job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+                let galley = ui.fonts_mut(|f| f.layout_job(job));
+                text_clip.galley(
+                    pos2(summary.right() + 10.0, mid - galley.size().y / 2.0),
+                    galley,
+                    t.text,
+                );
+            }
         }
 
         let small = FontId::proportional(11.5);
         if cols.hash > 0.0 {
-            painter.text(
-                pos2(rect.right() - cols.trailing(), mid),
+            let hash_left = rect.right() - cols.trailing();
+            let hash_clip = Rect::from_min_max(
+                pos2(hash_left, rect.top()),
+                pos2(hash_left + cols.hash - 6.0, rect.bottom()),
+            );
+            painter.with_clip_rect(hash_clip).text(
+                pos2(hash_left, mid),
                 Align2::LEFT_CENTER,
                 commit.hash.get(..7).unwrap_or(&commit.hash),
                 theme::mono(11.0),
@@ -1046,8 +1076,13 @@ impl RepoTab {
             );
         }
         if cols.date > 0.0 {
-            painter.text(
-                pos2(rect.right() - cols.date, mid),
+            let date_left = rect.right() - cols.date;
+            let date_clip = Rect::from_min_max(
+                pos2(date_left, rect.top()),
+                pos2(rect.right() - 4.0, rect.bottom()),
+            );
+            painter.with_clip_rect(date_clip).text(
+                pos2(date_left, mid),
                 Align2::LEFT_CENTER,
                 &commit.date,
                 theme::mono(11.0),
@@ -1135,11 +1170,19 @@ impl Badge {
 /// become one pill marked local and remote.
 fn badges(decorations: &[String], refs: &Refs) -> Vec<Badge> {
     let remote_of = |d: &str| {
-        refs.remotes.iter().find_map(|(remote, _)| {
-            d.strip_prefix(remote.as_str())
-                .and_then(|r| r.strip_prefix('/'))
-                .map(|branch| (remote.clone(), branch.to_owned()))
-        })
+        refs.remotes
+            .iter()
+            .find(|(_, list)| list.iter().any(|b| b.name == d))
+            .or_else(|| {
+                refs.remotes
+                    .iter()
+                    .find(|(remote, list)| list.is_empty() && d.starts_with(&format!("{remote}/")))
+            })
+            .and_then(|(remote, _)| {
+                d.strip_prefix(remote.as_str())
+                    .and_then(|r| r.strip_prefix('/'))
+                    .map(|branch| (remote.clone(), branch.to_owned()))
+            })
     };
     fn branch(out: &mut Vec<Badge>, name: &str) -> usize {
         match out
@@ -1161,7 +1204,11 @@ fn badges(decorations: &[String], refs: &Refs) -> Vec<Badge> {
     }
     let mut out: Vec<Badge> = Vec::new();
     for d in decorations {
+        if d == "grafted" || d == "refs/stash" {
+            continue;
+        }
         if let Some(name) = d.strip_prefix("HEAD -> ") {
+            let name = name.strip_prefix("refs/heads/").unwrap_or(name);
             let i = branch(&mut out, name);
             if let Some(b) = out.get_mut(i) {
                 b.local = true;
@@ -1193,9 +1240,13 @@ fn badges(decorations: &[String], refs: &Refs) -> Vec<Badge> {
                 b.remotes.push(remote);
             }
         } else {
-            let i = branch(&mut out, d);
+            let name = d.strip_prefix("refs/heads/").unwrap_or(d);
+            let i = branch(&mut out, name);
             if let Some(b) = out.get_mut(i) {
                 b.local = true;
+                if refs.current.as_deref() == Some(name) {
+                    b.head = true;
+                }
             }
         }
     }
@@ -1309,15 +1360,22 @@ fn truncate(painter: &egui::Painter, text: &str, font: &FontId, width: f32) -> S
         return text.to_owned();
     }
     let chars: Vec<char> = text.chars().collect();
-    let mut n = chars.len();
-    while n > 1 {
-        n -= 1;
-        let s: String = chars.iter().take(n).collect::<String>() + "…";
+    if chars.is_empty() {
+        return "…".to_owned();
+    }
+    let mut lo = 1usize;
+    let mut hi = chars.len();
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        let s: String = chars.iter().take(mid).collect::<String>() + "…";
         if fits(&s) {
-            return s;
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
-    "…".to_owned()
+    let s: String = chars.iter().take(lo).collect::<String>() + "…";
+    if fits(&s) { s } else { "…".to_owned() }
 }
 
 /// A small rounded count label; returns its width.

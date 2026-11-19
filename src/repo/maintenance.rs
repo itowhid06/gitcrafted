@@ -117,11 +117,8 @@ fn reflog_files(repo: &std::path::Path) -> Vec<String> {
 
 /// `args` followed by every ref with a reflog except `refs/stash` (a stash *is* that reflog),
 /// a few hundred refs per command.
-fn per_ref_steps(repo: &std::path::Path, args: &[&str]) -> Vec<Vec<String>> {
-    let mut refs: Vec<String> = refs_with_reflog(repo)
-        .into_iter()
-        .filter(|r| !r.is_empty() && r != "refs/stash")
-        .collect();
+fn per_ref_steps_from(mut refs: Vec<String>, args: &[&str]) -> Vec<Vec<String>> {
+    refs.retain(|r| !r.is_empty() && r != "refs/stash");
     refs.sort();
     refs.dedup();
     refs.chunks(REFS_PER_STEP)
@@ -133,12 +130,12 @@ fn per_ref_steps(repo: &std::path::Path, args: &[&str]) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn task_action(task: &Task, repo: &std::path::Path) -> Action {
-    let steps = if task.per_ref {
-        per_ref_steps(repo, task.args)
-    } else {
-        ops(&[task.args])
-    };
+#[cfg(test)]
+fn per_ref_steps(repo: &std::path::Path, args: &[&str]) -> Vec<Vec<String>> {
+    per_ref_steps_from(refs_with_reflog(repo), args)
+}
+
+fn task_action_steps(task: &Task, steps: Vec<Vec<String>>) -> Action {
     match task.danger {
         None => Action::Ops {
             label: task.label.to_owned(),
@@ -155,12 +152,23 @@ fn task_action(task: &Task, repo: &std::path::Path) -> Action {
     }
 }
 
+#[cfg(test)]
+fn task_action(task: &Task, repo: &std::path::Path) -> Action {
+    let steps = if task.per_ref {
+        per_ref_steps(repo, task.args)
+    } else {
+        ops(&[task.args])
+    };
+    task_action_steps(task, steps)
+}
+
 /// One `remote prune` per remote.
 fn prune_remotes_action(remotes: &[String]) -> Action {
     Action::Ops {
         label: "Prune remote branches".to_owned(),
         ops: remotes
             .iter()
+            .filter(|r| super::dialogs::valid_ref_name(r))
             .map(|r| vec!["remote".to_owned(), "prune".to_owned(), r.clone()])
             .collect(),
         refresh: Refresh::All,
@@ -169,20 +177,42 @@ fn prune_remotes_action(remotes: &[String]) -> Action {
 
 struct MaintenanceDialog {
     remotes: Vec<String>,
-    repo: std::path::PathBuf,
+    reflog_refs: Option<Vec<String>>,
+    reflog_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
 }
 
 impl RepoTab {
-    pub(super) fn maintenance_dialog(&self) -> Dialog {
+    pub(super) fn maintenance_dialog(&self, ctx: &egui::Context) -> Dialog {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo = self.path.clone();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(refs_with_reflog(&repo));
+            wake.request_repaint();
+        });
         dialog(MaintenanceDialog {
             remotes: self.remotes.iter().map(|r| r.name.clone()).collect(),
-            repo: self.path.clone(),
+            reflog_refs: None,
+            reflog_rx: Some(rx),
         })
     }
 }
 
 impl DialogBody for MaintenanceDialog {
     fn ui(&mut self, ui: &mut Ui, t: &Tokens, _enter: bool) -> Outcome {
+        if let Some(rx) = &self.reflog_rx {
+            match rx.try_recv() {
+                Ok(refs) => {
+                    self.reflog_refs = Some(refs);
+                    self.reflog_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.reflog_refs = Some(Vec::new());
+                    self.reflog_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         title(
             ui,
             "Maintenance",
@@ -190,29 +220,45 @@ impl DialogBody for MaintenanceDialog {
             t,
         );
         let mut outcome = Outcome::Open;
-        let task_row = |ui: &mut Ui, label: &str, help: &str| -> bool {
+        let btn_w = (ui.available_width() * 0.48).clamp(140.0, 210.0);
+        let task_row = |ui: &mut Ui, label: &str, help: &str, enabled: bool| -> bool {
             let clicked = ui
-                .horizontal(|ui| {
-                    let b = ui
-                        .add_sized([210.0, 26.0], egui::Button::new(label))
-                        .clicked();
+                .horizontal_wrapped(|ui| {
+                    let resp = ui.add_enabled(
+                        enabled,
+                        egui::Button::new(label).min_size(egui::vec2(btn_w, 26.0)),
+                    );
+                    if !enabled {
+                        ui.spinner();
+                    }
                     ui.label(RichText::new(help).color(t.text_faint).small());
-                    b
+                    resp.clicked()
                 })
                 .inner;
             ui.add_space(2.0);
             clicked
         };
         for task in TASKS {
-            if task_row(ui, task.label, task.help) {
-                outcome = Outcome::Done(task_action(task, &self.repo));
+            let ready = !task.per_ref || self.reflog_refs.is_some();
+            if task_row(ui, task.label, task.help, ready) {
+                let steps = if task.per_ref {
+                    per_ref_steps_from(self.reflog_refs.clone().unwrap_or_default(), task.args)
+                } else {
+                    ops(&[task.args])
+                };
+                outcome = Outcome::Done(task_action_steps(task, steps));
             }
         }
-        if !self.remotes.is_empty()
+        let valid_remotes = self
+            .remotes
+            .iter()
+            .any(|r| super::dialogs::valid_ref_name(&r.clone()));
+        if valid_remotes
             && task_row(
                 ui,
                 "Prune stale remote branches",
                 "Forgets remote-tracking branches deleted on the server.",
+                true,
             )
         {
             outcome = Outcome::Done(prune_remotes_action(&self.remotes));
@@ -234,6 +280,9 @@ struct CleanDialog {
     items: Vec<String>,
     error: Option<String>,
     repo: std::path::PathBuf,
+    loading: bool,
+    seq: u64,
+    rx: Option<std::sync::mpsc::Receiver<(u64, Result<Vec<String>, String>)>>,
 }
 
 /// `clean -n` lines: `Would remove path`, the path C-quoted when it holds quotes, backslashes or
@@ -290,7 +339,27 @@ fn unquote(path: &str) -> String {
 /// Paths per `clean` command, to stay below the command line's length limit.
 const PATHS_PER_STEP: usize = 200;
 
+fn preview_clean(repo: &std::path::Path, flags: &[&str]) -> Result<Vec<String>, String> {
+    // Unquoted non-ASCII names; the few quotes left are undone by `unquote`.
+    let mut args = vec!["-c", "core.quotePath=false", "clean", "-n"];
+    args.extend(flags);
+    git::run(Some(repo), &args).map(|out| parse_would_remove(&out))
+}
+
 impl CleanDialog {
+    fn new(repo: std::path::PathBuf, dirs: bool, ignored: usize) -> Self {
+        Self {
+            dirs,
+            ignored,
+            items: Vec::new(),
+            error: None,
+            repo,
+            loading: false,
+            seq: 0,
+            rx: None,
+        }
+    }
+
     fn flags(&self) -> Vec<&'static str> {
         let mut flags = Vec::new();
         if self.dirs {
@@ -325,13 +394,27 @@ impl CleanDialog {
         }
     }
 
+    fn start_refresh(&mut self, ctx: &egui::Context) {
+        self.seq = self.seq.wrapping_add(1);
+        self.loading = true;
+        let seq = self.seq;
+        let repo = self.repo.clone();
+        let flags: Vec<String> = self.flags().into_iter().map(str::to_owned).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let refs: Vec<&str> = flags.iter().map(String::as_str).collect();
+            let _ = tx.send((seq, preview_clean(&repo, &refs)));
+            wake.request_repaint();
+        });
+    }
+
+    #[cfg(test)]
     fn refresh(&mut self) {
-        // Unquoted non-ASCII names; the few quotes left are undone by `unquote`.
-        let mut args = vec!["-c", "core.quotePath=false", "clean", "-n"];
-        args.extend(self.flags());
-        match git::run(Some(&self.repo), &args) {
-            Ok(out) => {
-                self.items = parse_would_remove(&out);
+        match preview_clean(&self.repo, &self.flags()) {
+            Ok(items) => {
+                self.items = items;
                 self.error = None;
             }
             Err(e) => {
@@ -343,21 +426,43 @@ impl CleanDialog {
 }
 
 impl RepoTab {
-    pub(super) fn clean_dialog(&self) -> Dialog {
-        let mut d = CleanDialog {
-            dirs: true,
-            ignored: 0,
-            items: Vec::new(),
-            error: None,
-            repo: self.path.clone(),
-        };
-        d.refresh();
+    pub(super) fn clean_dialog(&self, ctx: &egui::Context) -> Dialog {
+        let mut d = CleanDialog::new(self.path.clone(), true, 0);
+        d.start_refresh(ctx);
         dialog(d)
     }
 }
 
 impl DialogBody for CleanDialog {
     fn ui(&mut self, ui: &mut Ui, t: &Tokens, _enter: bool) -> Outcome {
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok((seq, res)) if seq == self.seq => {
+                        self.loading = false;
+                        self.rx = None;
+                        match res {
+                            Ok(items) => {
+                                self.items = items;
+                                self.error = None;
+                            }
+                            Err(e) => {
+                                self.items.clear();
+                                self.error = Some(e);
+                            }
+                        }
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.loading = false;
+                        self.rx = None;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                }
+            }
+        }
         title(
             ui,
             "Clean untracked files",
@@ -367,7 +472,7 @@ impl DialogBody for CleanDialog {
         let mut changed = ui
             .checkbox(&mut self.dirs, "Include untracked folders")
             .changed();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (i, label) in [
                 "Not ignored files",
                 "Ignored files too",
@@ -382,16 +487,23 @@ impl DialogBody for CleanDialog {
             }
         });
         if changed {
-            self.refresh();
+            self.start_refresh(ui.ctx());
         }
         ui.add_space(4.0);
         if let Some(e) = &self.error {
             ui.colored_label(t.danger, e);
         }
-        ui.label(
-            RichText::new(format!("{} item(s) would be deleted", self.items.len()))
-                .color(t.text_dim),
-        );
+        ui.horizontal(|ui| {
+            if self.loading {
+                ui.spinner();
+                ui.label(RichText::new("Scanning files…").color(t.text_dim));
+            } else {
+                ui.label(
+                    RichText::new(format!("{} item(s) would be deleted", self.items.len()))
+                        .color(t.text_dim),
+                );
+            }
+        });
         egui::ScrollArea::vertical()
             .max_height(200.0)
             .auto_shrink([false, true])
@@ -403,7 +515,7 @@ impl DialogBody for CleanDialog {
         ui.add_space(8.0);
         let mut outcome = Outcome::Open;
         ui.horizontal(|ui| {
-            let can = !self.items.is_empty();
+            let can = !self.loading && !self.items.is_empty();
             if ui
                 .add_enabled(
                     can,
@@ -446,13 +558,7 @@ mod tests {
         std::fs::write(dir.join("build/out.o"), "x").ok();
         std::fs::write(dir.join(".gitignore"), "*.log\n").ok();
         std::fs::write(dir.join("a.log"), "x").ok();
-        let mut d = CleanDialog {
-            dirs: true,
-            ignored: 0,
-            items: Vec::new(),
-            error: None,
-            repo: dir.clone(),
-        };
+        let mut d = CleanDialog::new(dir.clone(), true, 0);
         d.refresh();
         assert!(d.items.contains(&"junk.txt".to_owned()));
         assert!(d.items.contains(&"build/".to_owned()));
@@ -639,13 +745,7 @@ mod flow_tests {
     }
 
     fn clean_dialog(dir: &std::path::Path) -> CleanDialog {
-        let mut d = CleanDialog {
-            dirs: true,
-            ignored: 0,
-            items: Vec::new(),
-            error: None,
-            repo: dir.to_path_buf(),
-        };
+        let mut d = CleanDialog::new(dir.to_path_buf(), true, 0);
         d.refresh();
         d
     }
@@ -703,7 +803,7 @@ mod flow_tests {
         let mut f = Fixture::open(&dir);
         let d = clean_dialog(&dir);
         assert!(d.items.is_empty());
-        assert!(matches!(f.tab.clean_dialog(), Dialog::Ext(_)));
+        assert!(matches!(f.tab.clean_dialog(&f.ctx), Dialog::Ext(_)));
         f.run(d.action());
         assert_eq!(read(&dir, "a.txt"), "modified\n");
     }
@@ -712,7 +812,7 @@ mod flow_tests {
     fn the_maintenance_dialog_opens_with_the_tabs_remotes() {
         let (work, _bare) = repo_with_remote("mt-dialog");
         let f = Fixture::open(&work);
-        assert!(matches!(f.tab.maintenance_dialog(), Dialog::Ext(_)));
+        assert!(matches!(f.tab.maintenance_dialog(&f.ctx), Dialog::Ext(_)));
     }
 }
 
@@ -906,13 +1006,7 @@ mod safety_tests {
     }
 
     fn preview(dir: &std::path::Path, dirs: bool, ignored: usize) -> CleanDialog {
-        let mut d = CleanDialog {
-            dirs,
-            ignored,
-            items: Vec::new(),
-            error: None,
-            repo: dir.to_path_buf(),
-        };
+        let mut d = CleanDialog::new(dir.to_path_buf(), dirs, ignored);
         d.refresh();
         d
     }

@@ -122,12 +122,35 @@ impl RebaseEditor {
     /// Writes the todo list and the new messages to a fresh temporary folder and returns the
     /// git command that runs the rebase with them.
     pub fn command(&self) -> Result<Vec<String>, String> {
-        let dir = std::env::temp_dir().join(format!(
-            "gitcrafted-rebase-{}-{}",
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let old = name.starts_with("gitcrafted-rebase-")
+                    && e.metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() > 24 * 3600);
+                if old {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = root.join(format!(
+            "gitcrafted-rebase-{}-{}-{seq}",
             std::process::id(),
             crate::git::now()
         ));
         std::fs::create_dir_all(&dir).map_err(|e| format!("could not prepare the rebase: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         let write = |name: &str, text: &str| -> Result<PathBuf, String> {
             let path = dir.join(name);
             std::fs::write(&path, text)
@@ -171,7 +194,7 @@ fn todo(entries: &[Entry], message_file: impl Fn(usize) -> Option<String>) -> St
         out.push_str(&format!("{verb} {} {}\n", e.commit.hash, e.commit.summary));
         if let Some(file) = message_file(i) {
             out.push_str(&format!(
-                "exec git commit --amend --allow-empty --cleanup=strip -F {file}\n"
+                "exec git commit --amend --allow-empty --cleanup=whitespace -F {file}\n"
             ));
         }
     }
@@ -342,7 +365,7 @@ impl RepoTab {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut e.message)
                                         .desired_rows(3)
-                                        .desired_width(ui.available_width() - 16.0),
+                                        .desired_width((ui.available_width() - 16.0).max(120.0)),
                                 );
                             });
                         }
@@ -385,7 +408,7 @@ mod tests {
         let todo = todo(&entries, |i| (i == 1).then(|| "'/tmp/m 1.txt'".to_owned()));
         assert_eq!(
             todo,
-            "pick a1 summary a1\npick b2 summary b2\nexec git commit --amend --allow-empty --cleanup=strip -F '/tmp/m 1.txt'\nsquash c3 summary c3\ndrop d4 summary d4\n"
+            "pick a1 summary a1\npick b2 summary b2\nexec git commit --amend --allow-empty --cleanup=whitespace -F '/tmp/m 1.txt'\nsquash c3 summary c3\ndrop d4 summary d4\n"
         );
     }
 

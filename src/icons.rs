@@ -87,12 +87,14 @@ fn white_icons() -> &'static HashMap<&'static str, Arc<[u8]>> {
     })
 }
 
-/// An egui image for an icon, tinted. Unknown names give an empty image.
+const FALLBACK_SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'/>";
+
+/// An egui image for an icon, tinted. Unknown names give an empty transparent image.
 pub fn image(name: &str, size: f32, tint: Color32) -> egui::Image<'static> {
     let bytes = white_icons()
         .get(name)
         .cloned()
-        .unwrap_or_else(|| Arc::from(Vec::new().into_boxed_slice()));
+        .unwrap_or_else(|| Arc::from(FALLBACK_SVG.to_vec().into_boxed_slice()));
     egui::Image::from_bytes(format!("bytes://icons/{name}.svg"), Bytes::Shared(bytes))
         .fit_to_exact_size(Vec2::splat(size))
         .tint(tint)

@@ -228,7 +228,12 @@ impl Fixture {
         let needed = if cfg!(windows) { 14 } else { 4 };
         while quiet < needed {
             let got = self.drain();
-            if got || self.tab.loading || self.tab.busy_op.is_some() || self.detail_pending() {
+            if got
+                || self.tab.loading
+                || self.tab.reload_queued
+                || self.tab.busy_op.is_some()
+                || self.detail_pending()
+            {
                 quiet = 0;
             } else {
                 quiet += 1;

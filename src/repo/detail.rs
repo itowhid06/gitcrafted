@@ -85,6 +85,9 @@ impl RepoTab {
             return;
         };
 
+        let allow_reword_keys = !self.keys_blocked
+            && !self.has_dialog()
+            && !egui::Popup::is_any_open(ui.ctx());
         // Taken out while the pane borrows `self`; put back after it.
         let mut reword = self.reword.take();
         let head = self.refs.head.clone();
@@ -104,7 +107,7 @@ impl RepoTab {
                         let mut close = false;
                         match reword.as_mut().filter(|r| r.hash == detail.hash) {
                             Some(r) => {
-                                if let Some(save) = reword_editor(ui, r) {
+                                if let Some(save) = reword_editor(ui, r, allow_reword_keys) {
                                     let message = r.message();
                                     if save && message != detail.message.trim() {
                                         acts.push(Action::Reword {
@@ -127,7 +130,7 @@ impl RepoTab {
                                 } else {
                                     Sense::hover()
                                 };
-                                let summary = super::issues::linked_text(
+                                let (summary, summary_link) = super::issues::linked_text_hit(
                                     ui,
                                     subject,
                                     theme::semibold(15.0),
@@ -135,7 +138,7 @@ impl RepoTab {
                                     &issue_rules,
                                     sense,
                                 );
-                                let mut clicked = if editable {
+                                let summary = if editable && !summary_link {
                                     summary.on_hover_text("Double-click to edit the message")
                                 } else if detail.in_head && detail.merges_after {
                                     summary.on_hover_text(
@@ -143,19 +146,19 @@ impl RepoTab {
                                     )
                                 } else {
                                     summary
-                                }
-                                .double_clicked();
+                                };
+                                let mut clicked = summary.double_clicked() && !summary_link;
                                 if !body.is_empty() {
                                     ui.add_space(2.0);
-                                    clicked |= super::issues::linked_text(
+                                    let (body_resp, body_link) = super::issues::linked_text_hit(
                                         ui,
                                         body,
                                         egui::TextStyle::Body.resolve(ui.style()),
                                         t.text_dim,
                                         &issue_rules,
                                         sense,
-                                    )
-                                    .double_clicked();
+                                    );
+                                    clicked |= body_resp.double_clicked() && !body_link;
                                 }
                                 if clicked && editable {
                                     reword = Some(Reword {
@@ -524,9 +527,11 @@ impl RepoTab {
                 for f in staged {
                     match self.work_row(ui, acts, f, &[("minus", "Unstage")]) {
                         RowClick::Open => acts.push(Action::OpenDiff(DiffKey::Work(f.clone()))),
-                        RowClick::Button(_) => {
-                            acts.push(stage_action("Unstage", vec![unstage_args(&head, &f.path)]))
-                        }
+                        RowClick::Button(_) => acts.push(Action::Ops {
+                            label: "Unstage".to_owned(),
+                            ops: vec![unstage_args(&head, &f.path, f.old_path.as_deref())],
+                            refresh: Refresh::Status,
+                        }),
                         RowClick::None => {}
                     }
                 }
@@ -594,19 +599,18 @@ impl RepoTab {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let amend = ui
                     .add_enabled(
-                        !rebasing && !self.refs.head.is_empty(),
+                        self.work.in_progress.is_none() && !self.refs.head.is_empty(),
                         egui::Checkbox::new(&mut self.amend, "Amend last commit"),
                     )
                     .on_hover_text(
                         "Rewrite the last commit with the staged changes and this message",
                     );
-                if amend.changed() && self.amend && self.commit_summary.trim().is_empty() {
-                    // Start from the message being amended.
-                    if let Ok(msg) = crate::git::head_message(&self.path) {
-                        let (summary, body) = msg.split_once('\n').unwrap_or((msg.as_str(), ""));
-                        self.commit_summary = summary.trim().to_owned();
-                        self.commit_body = body.trim().to_owned();
-                    }
+                if amend.changed() && self.amend && self.commit_summary.trim().is_empty()
+                    && let Some(msg) = &self.head_message
+                {
+                    let (summary, body) = msg.split_once('\n').unwrap_or((msg.as_str(), ""));
+                    self.commit_summary = summary.trim().to_owned();
+                    self.commit_body = body.trim().to_owned();
                 }
             });
         });
@@ -628,13 +632,19 @@ impl RepoTab {
             }
         }
         ui.add_space(2.0);
-        let summary = ui.add(
+        let summary = ui.add_enabled(
+            !rebasing,
             egui::TextEdit::singleline(&mut self.commit_summary)
-                .hint_text("Summary")
+                .hint_text(if rebasing {
+                    "Rebase uses each commit's message"
+                } else {
+                    "Summary"
+                })
                 .desired_width(f32::INFINITY)
                 .margin(egui::Margin::symmetric(8, 6)),
         );
-        let body = ui.add(
+        let body = ui.add_enabled(
+            !rebasing,
             egui::TextEdit::multiline(&mut self.commit_body)
                 .hint_text("Description (optional)")
                 .desired_width(f32::INFINITY)
@@ -642,7 +652,7 @@ impl RepoTab {
                 .margin(egui::Margin::symmetric(8, 6)),
         );
         let len = self.commit_summary.chars().count();
-        if len > 72 {
+        if !rebasing && len > 72 {
             ui.label(
                 RichText::new(format!("Summary is {len} characters; 50–72 reads best"))
                     .color(t.warning)
@@ -660,12 +670,15 @@ impl RepoTab {
         } else {
             "Stage all and commit".to_owned()
         };
-        let can = idle && !self.commit_summary.trim().is_empty() && self.work.conflicted.is_empty();
+        let can =
+            idle && (rebasing || !self.commit_summary.trim().is_empty()) && self.work.conflicted.is_empty();
         // Only from the message fields, so Ctrl+Enter in the terminal stays the shell's.
         let shortcut = (summary.has_focus() || body.has_focus())
+            && !self.keys_blocked
+            && !self.has_dialog()
             && ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
-        // Next to it, commit and push in one go.
-        let push_w = if rebasing || self.remotes.is_empty() {
+        // Next to it, commit and push in one go (only when on a branch with a remote).
+        let push_w = if rebasing || self.remotes.is_empty() || self.refs.current.is_none() {
             0.0
         } else {
             96.0
@@ -780,8 +793,11 @@ pub(super) fn discard_dialog(f: &StatusFile) -> Dialog {
 /// "N files changed +a −d", and an optional note on the right.
 fn files_header(ui: &mut Ui, files: &[ChangedFile], note: Option<&str>) {
     let t = Tokens::get(ui.ctx());
-    let (adds, dels) = files.iter().fold((0, 0), |(a, d), f| {
-        (a + f.added.unwrap_or(0), d + f.removed.unwrap_or(0))
+    let (adds, dels) = files.iter().fold((0u64, 0u64), |(a, d), f| {
+        (
+            a.saturating_add(u64::from(f.added.unwrap_or(0))),
+            d.saturating_add(u64::from(f.removed.unwrap_or(0))),
+        )
     });
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
     let p = ui.painter();
@@ -888,7 +904,7 @@ impl Reword {
 
 /// The summary and description being edited, with Save and Cancel: `Some(true)` to save,
 /// `Some(false)` to cancel.
-fn reword_editor(ui: &mut Ui, reword: &mut Reword) -> Option<bool> {
+fn reword_editor(ui: &mut Ui, reword: &mut Reword, allow_keys: bool) -> Option<bool> {
     let t = Tokens::get(ui.ctx());
     let summary = ui.add(
         egui::TextEdit::singleline(&mut reword.subject)
@@ -901,7 +917,7 @@ fn reword_editor(ui: &mut Ui, reword: &mut Reword) -> Option<bool> {
         reword.focus = false;
     }
     ui.add_space(4.0);
-    ui.add(
+    let body = ui.add(
         egui::TextEdit::multiline(&mut reword.body)
             .hint_text("Description (optional)")
             .desired_rows(4)
@@ -909,12 +925,18 @@ fn reword_editor(ui: &mut Ui, reword: &mut Reword) -> Option<bool> {
     );
     ui.add_space(6.0);
     let can_save = !reword.subject.trim().is_empty();
-    let (save_keys, cancel_keys) = ui.input(|i| {
-        (
-            i.modifiers.command && i.key_pressed(Key::Enter),
-            i.key_pressed(Key::Escape),
-        )
-    });
+    let (save_keys, cancel_keys) = if allow_keys {
+        ui.input(|i| {
+            (
+                (summary.has_focus() || body.has_focus())
+                    && i.modifiers.command
+                    && i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Escape),
+            )
+        })
+    } else {
+        (false, false)
+    };
     let mut out = None;
     ui.horizontal(|ui| {
         if widgets::primary_button(ui, "Save message", can_save, 110.0).clicked() {

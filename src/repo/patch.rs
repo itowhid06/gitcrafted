@@ -224,14 +224,14 @@ impl RepoTab {
         if self.busy_op.is_some() {
             return;
         }
-        let Some(dest) = rfd::FileDialog::new()
-            .set_title("Save patch")
-            .set_file_name(suggested_name(&source, self.refs.current.as_deref()))
-            .add_filter("Patch", &["patch", "diff"])
-            .save_file()
-        else {
+        let name = suggested_name(&source, self.refs.current.as_deref());
+        self.pick_save_patch(source, &name, ctx);
+    }
+
+    pub(super) fn save_patch_to(&mut self, source: PatchSource, dest: PathBuf, ctx: &egui::Context) {
+        if self.busy_op.is_some() {
             return;
-        };
+        }
         let file = dest
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -247,6 +247,7 @@ impl RepoTab {
             refresh: Refresh::All,
             kind: OpKind::Normal(Undo::None, String::new()),
             quiet: false,
+            failed_step: None,
         });
     }
 
@@ -378,7 +379,7 @@ impl Whitespace {
 pub struct ApplyDialog {
     /// Relative paths are the repository's, as git (run in it) reads them.
     repo: PathBuf,
-    file: String,
+    pub(super) file: String,
     whitespace: Whitespace,
     /// Stage what the patch changes too (`--index`).
     index: bool,
@@ -439,24 +440,20 @@ impl ApplyDialog {
             "Apply the changes of a patch file (from git diff, format-patch or Save as patch).",
             t,
         );
+        let mut pick_file = false;
         row(ui, t, "Patch file", |ui| {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.file)
                     .hint_text("/path/to/changes.patch")
-                    .desired_width(ui.available_width() - 92.0)
+                    .desired_width((ui.available_width() - 92.0).max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
             );
             if self.focus {
                 edit.request_focus();
                 self.focus = false;
             }
-            if ui.button("Browse…").clicked()
-                && let Some(picked) = rfd::FileDialog::new()
-                    .set_title("Choose a patch")
-                    .add_filter("Patch", &["patch", "diff", "txt"])
-                    .pick_file()
-            {
-                self.file = picked.display().to_string();
+            if ui.button("Browse…").clicked() {
+                pick_file = true;
             }
         });
         row(ui, t, "Whitespace", |ui| {
@@ -482,16 +479,52 @@ impl ApplyDialog {
         );
         ui.checkbox(&mut self.reverse, "Apply in reverse (undo this patch)");
         ui.add_space(8.0);
-        let file = self.file.trim();
-        let valid = !file.is_empty() && self.patch_path().is_file();
-        if !file.is_empty() && !valid {
+        let file = self.file.trim().to_owned();
+        let (is_file, too_large) = if file.is_empty() {
+            (false, false)
+        } else {
+            const MAX_PATCH_BYTES: u64 = 50 * 1024 * 1024;
+            let stat_id = egui::Id::new(("gitcrafted-apply-stat", &self.repo));
+            let now = Instant::now();
+            let cached = ui.ctx().data(|d| {
+                d.get_temp::<(String, Instant, bool, bool)>(stat_id)
+            });
+            match cached {
+                Some((ref s, at, f, big))
+                    if *s == file && now.duration_since(at).as_millis() < 500 =>
+                {
+                    (f, big)
+                }
+                _ => {
+                    let meta = std::fs::metadata(self.patch_path());
+                    let is_f = meta.as_ref().is_ok_and(|m| m.is_file());
+                    let big = meta.as_ref().is_ok_and(|m| m.len() > MAX_PATCH_BYTES);
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(stat_id, (file.clone(), now, is_f, big)));
+                    (is_f, big)
+                }
+            }
+        };
+        let valid = !file.is_empty() && is_file && !too_large;
+        if !file.is_empty() && !is_file {
             ui.label(
                 RichText::new("That file doesn't exist.")
                     .color(t.danger)
                     .small(),
             );
+        } else if too_large {
+            ui.label(
+                RichText::new("That patch file is larger than 50 MiB.")
+                    .color(t.danger)
+                    .small(),
+            );
         }
-        buttons(ui, "Apply", valid, enter, || self.action())
+        let outcome = buttons(ui, "Apply", valid, enter, || self.action());
+        if pick_file && matches!(outcome, Outcome::Open) {
+            Outcome::PickApplyPatch
+        } else {
+            outcome
+        }
     }
 
     /// The commands: staging variants first refresh the index, whose cached file stats go stale

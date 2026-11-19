@@ -35,6 +35,7 @@ pub(crate) struct FileView {
 pub(crate) struct BlameData {
     lines: Vec<BlameLine>,
     spans: Option<Vec<Spans>>,
+    longest: usize,
     /// Oldest and newest commit time, for the age colour.
     span: (i64, i64),
 }
@@ -68,9 +69,15 @@ pub(crate) fn load_blame(
 ) -> Result<BlameData, String> {
     let lines = git::blame(repo, rev, path)?;
     let spans = highlight::highlight(path, lines.iter().map(|l| l.text.as_str()), dark);
+    let longest = lines.iter().map(|l| l.text.chars().count()).max().unwrap_or(0);
     let times = lines.iter().filter(|l| !l.uncommitted()).map(|l| l.time);
     let span = (times.clone().min().unwrap_or(0), times.max().unwrap_or(0));
-    Ok(BlameData { lines, spans, span })
+    Ok(BlameData {
+        lines,
+        spans,
+        longest,
+        span,
+    })
 }
 
 impl RepoTab {
@@ -238,6 +245,12 @@ impl RepoTab {
             }
             Some(Ok(d)) => d,
         };
+        if data.lines.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("This file has no lines.").color(t.text_dim));
+            });
+            return;
+        }
         let now = git::now();
         let font = theme::mono(12.0);
         let char_w = ui
@@ -245,12 +258,7 @@ impl RepoTab {
             .layout_no_wrap("M".to_owned(), font.clone(), t.text)
             .size()
             .x;
-        let longest = data
-            .lines
-            .iter()
-            .map(|l| l.text.chars().count())
-            .max()
-            .unwrap_or(0) as f32;
+        let longest = data.longest as f32;
         let width = (GUTTER_W + NUM_W + 16.0 + longest * char_w + 24.0).max(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
         egui::ScrollArea::both()
@@ -380,7 +388,9 @@ fn age_color(t: &Tokens, line: &BlameLine, (oldest, newest): (i64, i64)) -> Colo
         return t.warning;
     }
     let f = if newest > oldest {
-        (line.time - oldest) as f32 / (newest - oldest) as f32
+        let num = i128::from(line.time) - i128::from(oldest);
+        let den = i128::from(newest) - i128::from(oldest);
+        (num as f64 / den as f64).clamp(0.0, 1.0) as f32
     } else {
         1.0
     };

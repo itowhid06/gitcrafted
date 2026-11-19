@@ -10,9 +10,9 @@ use super::{Action, Dialog, Refresh, RepoTab, ops, short};
 use crate::git;
 use crate::theme::Tokens;
 
-/// What the bar shows, read again when HEAD moves.
+/// What the bar shows, read again when HEAD or BISECT_LOG changes.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
-struct Info {
+pub(crate) struct Info {
     head: String,
     /// When the bisect log last changed: marking can leave HEAD where it was.
     stamp: Option<std::time::SystemTime>,
@@ -96,47 +96,35 @@ fn mark(label: &str, verb: &str, rev: Option<&str>) -> Action {
     }
 }
 
+/// Reads active bisect state off the UI thread (`None` when no bisect is in progress).
+pub(super) fn read_state(repo: &std::path::Path, head: &str) -> Option<Info> {
+    let raw = git::run(Some(repo), &["rev-parse", "--git-path", "BISECT_LOG"]).ok()?;
+    let rel = std::path::Path::new(raw.trim());
+    let path = if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        repo.join(rel)
+    };
+    path.exists().then(|| read_info(repo, head, None))
+}
+
 impl RepoTab {
-    fn bisect_log_path(&self, ctx: &egui::Context) -> Option<std::path::PathBuf> {
-        let id = egui::Id::new(("gitcrafted-bisect-log", &self.path));
-        if let Some(p) = ctx.data(|d| d.get_temp::<Option<std::path::PathBuf>>(id)) {
-            return p;
-        }
-        let path = git::run(Some(&self.path), &["rev-parse", "--git-path", "BISECT_LOG"])
-            .ok()
-            .map(|p| self.path.join(p.trim()));
-        ctx.data_mut(|d| d.insert_temp(id, path.clone()));
-        path
+    /// Whether a bisect is currently running (cached from background reloads).
+    pub(super) fn bisecting(&self, _ctx: &egui::Context) -> bool {
+        self.bisect.is_some()
     }
 
-    /// A bisect is running (a stat of one file).
-    pub(super) fn bisecting(&self, ctx: &egui::Context) -> bool {
-        self.bisect_log_path(ctx).is_some_and(|p| p.exists())
-    }
-
-    fn bisect_info(&self, ctx: &egui::Context) -> Info {
-        let id = egui::Id::new(("gitcrafted-bisect-info", &self.path));
-        let stamp = self
-            .bisect_log_path(ctx)
-            .and_then(|p| p.metadata().and_then(|m| m.modified()).ok());
-        if let Some(info) = ctx.data(|d| d.get_temp::<Info>(id))
-            && info.head == self.refs.head
-            && info.stamp == stamp
-        {
-            return info;
-        }
-        let info = read_info(&self.path, &self.refs.head, stamp);
-        ctx.data_mut(|d| d.insert_temp(id, info.clone()));
-        info
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn bisect_info(&self, _ctx: &egui::Context) -> Info {
+        self.bisect.clone().unwrap_or_default()
     }
 
     /// The bar under the toolbar while a bisect runs.
     pub(super) fn bisect_bar(&self, ui: &mut Ui, acts: &mut Vec<Action>) {
-        if !self.bisecting(ui.ctx()) {
+        let Some(info) = &self.bisect else {
             return;
-        }
+        };
         let t = Tokens::get(ui.ctx());
-        let info = self.bisect_info(ui.ctx());
         let idle = self.busy_op.is_none();
         egui::Panel::top("bisect_bar")
             .frame(
@@ -146,12 +134,16 @@ impl RepoTab {
                     .stroke(egui::Stroke::new(1.0, t.separator)),
             )
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Bisecting").font(crate::theme::semibold(12.5)));
                     match &info.first_bad {
                         Some(found) => {
-                            ui.label(
-                                RichText::new(format!("First bad commit: {found}")).color(t.danger),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("First bad commit: {found}"))
+                                        .color(t.danger),
+                                )
+                                .truncate(),
                             );
                         }
                         None => {
@@ -165,7 +157,7 @@ impl RepoTab {
                                 (_, 0, _) => "mark a commit that is bad".to_owned(),
                                 _ => format!("testing {}", short(&self.refs.head)),
                             };
-                            ui.label(RichText::new(text).color(t.text_dim));
+                            ui.add(egui::Label::new(RichText::new(text).color(t.text_dim)).truncate());
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -266,6 +258,13 @@ impl BisectDialog {
     }
 }
 
+fn valid_rev(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && !t.starts_with('-')
+        && !t.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 impl DialogBody for BisectDialog {
     fn ui(&mut self, ui: &mut Ui, t: &Tokens, enter: bool) -> Outcome {
         title(
@@ -302,7 +301,8 @@ impl DialogBody for BisectDialog {
             .small(),
         );
         ui.add_space(8.0);
-        let valid = !self.bad.trim().is_empty();
+        let valid =
+            valid_rev(&self.bad) && (self.good.trim().is_empty() || valid_rev(&self.good));
         buttons(ui, "Start", valid, enter, || Action::Ops {
             label: "Start bisect".to_owned(),
             ops: self.steps(),

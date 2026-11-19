@@ -11,8 +11,10 @@ use syntect::parsing::SyntaxSet;
 /// Coloured pieces of one line.
 pub type Spans = Vec<(Color32, String)>;
 
-/// Bigger diffs stay uncoloured: highlighting is the slow part of opening them.
+/// Bigger diffs or minified blobs stay uncoloured: highlighting is the slow part of opening them.
 const MAX_LINES: usize = 8000;
+const MAX_LINE_BYTES: usize = 4096;
+const MAX_TOTAL_BYTES: usize = 512 * 1024;
 
 fn syntaxes() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -25,7 +27,7 @@ fn themes() -> &'static ThemeSet {
 }
 
 /// Colours `lines` (one file's text, in order) for `path`; `None` for plain text, unknown
-/// types or very long inputs.
+/// types, minified lines, or very long inputs.
 pub fn highlight<'a>(
     path: &str,
     lines: impl ExactSizeIterator<Item = &'a str>,
@@ -34,14 +36,27 @@ pub fn highlight<'a>(
     if lines.len() > MAX_LINES {
         return None;
     }
+    let collected: Vec<&'a str> = lines.collect();
+    let mut total_bytes = 0usize;
+    for &line in &collected {
+        if line.len() > MAX_LINE_BYTES {
+            return None;
+        }
+        total_bytes = total_bytes.saturating_add(line.len());
+        if total_bytes > MAX_TOTAL_BYTES {
+            return None;
+        }
+    }
     let ss = syntaxes();
     let file = std::path::Path::new(path);
     let name = file.file_name()?.to_string_lossy();
-    // By extension, or by the whole name for files like `Dockerfile` and `Makefile`.
-    let syntax = file
-        .extension()
-        .and_then(|e| ss.find_syntax_by_extension(&e.to_string_lossy().to_lowercase()))
-        .or_else(|| ss.find_syntax_by_extension(&name))?;
+    // Match exact filenames (e.g. `Dockerfile`, `Makefile`, `Cargo.lock`) first, then extension.
+    let syntax = ss
+        .find_syntax_by_extension(&name)
+        .or_else(|| {
+            file.extension()
+                .and_then(|e| ss.find_syntax_by_extension(&e.to_string_lossy().to_lowercase()))
+        })?;
     if syntax.name == "Plain Text" {
         return None;
     }
@@ -59,8 +74,8 @@ pub fn highlight<'a>(
         })?,
     };
     let mut h = HighlightLines::new(syntax, theme);
-    let mut out = Vec::new();
-    for line in lines {
+    let mut out = Vec::with_capacity(collected.len());
+    for line in collected {
         let with_nl = format!("{line}\n");
         let ranges = h.highlight_line(&with_nl, ss).ok()?;
         out.push(

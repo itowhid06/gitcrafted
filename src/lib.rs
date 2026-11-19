@@ -13,6 +13,7 @@ pub fn prepare() {
 pub mod app;
 mod avatars;
 mod desktop_entry;
+pub mod file_dialog;
 mod forge;
 mod git;
 mod graph;

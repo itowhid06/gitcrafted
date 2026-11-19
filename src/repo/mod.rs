@@ -56,25 +56,27 @@ const LONG_OP: Duration = Duration::from_secs(4);
 
 /// Results coming back from background git calls.
 enum Msg {
-    Loaded(Result<Box<Loaded>, String>),
+    Loaded(u64, Result<Box<Loaded>, String>),
     More(Result<Vec<Commit>, String>),
-    Status(Result<WorkStatus, String>),
-    Detail(String, Result<CommitDetail, String>),
+    Status(u64, Result<WorkStatus, String>),
+    Detail(u64, String, Result<CommitDetail, String>),
     /// The answer to the diff request numbered so (see [`DiffView::next_request`]).
     Diff(u64, Result<diff::DiffData, String>),
-    FileHistory(String, Result<Vec<git::FileCommit>, String>),
-    Blame(String, Option<String>, Result<file_view::BlameData, String>),
+    FileHistory(u64, String, Result<Vec<git::FileCommit>, String>),
+    Blame(u64, String, Option<String>, Result<file_view::BlameData, String>),
     RebaseCommits {
+        seq: u64,
         onto: String,
         label: String,
         result: Result<Vec<git::RebaseCommit>, String>,
     },
-    Search(String, Result<Vec<String>, String>),
+    Search(u64, String, Result<Vec<String>, String>),
     /// A comparison's files, for the request numbered so.
     Compare(u64, Result<CompareData, String>),
-    Prs(Result<Vec<PullRequest>, String>),
+    Prs(u64, Result<Vec<PullRequest>, String>),
     /// The commits to replay when rewording `hash`.
     RewordCommits {
+        seq: u64,
         hash: String,
         message: String,
         result: Result<Vec<git::RebaseCommit>, String>,
@@ -85,7 +87,15 @@ enum Msg {
         refresh: Refresh,
         kind: OpKind,
         quiet: bool,
+        failed_step: Option<usize>,
     },
+    WatcherReady(notify::RecommendedWatcher, Receiver<bool>),
+}
+
+pub(super) enum RepoPicker {
+    WorktreeDir,
+    ApplyPatch,
+    SavePatch(patch::PatchSource),
 }
 
 struct Loaded {
@@ -97,6 +107,9 @@ struct Loaded {
     stashes: Vec<Stash>,
     remotes: Vec<Remote>,
     identity: Identity,
+    head_message: Option<String>,
+    bisect: Option<bisect::Info>,
+    issue_rules: Vec<issues::Rule>,
     /// How many commits were asked for (more exist when that many came back).
     requested: usize,
 }
@@ -139,6 +152,7 @@ struct PendingOp {
     refresh: Refresh,
     kind: OpKind,
     quiet: bool,
+    remote_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -149,7 +163,7 @@ enum OpKind {
 }
 
 /// Which diff the central area shows.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DiffKey {
     Commit {
         hash: String,
@@ -167,6 +181,8 @@ pub(crate) enum DiffKey {
 pub(crate) struct DiffView {
     key: DiffKey,
     data: Option<Result<diff::DiffData, String>>,
+    /// Image URIs previously loaded on this view that must be evicted from egui's loader cache.
+    pub(super) stale_uris: Vec<String>,
     /// Changed lines clicked, to stage, unstage or discard only those.
     chosen: std::collections::BTreeSet<usize>,
     /// The last line clicked, where a Shift+click range starts.
@@ -186,6 +202,7 @@ impl DiffView {
         Self {
             key,
             data: None,
+            stale_uris: Vec::new(),
             chosen: Default::default(),
             anchor: None,
             text_sel: None,
@@ -199,10 +216,28 @@ impl DiffView {
         self.request
     }
 
+    fn forget_images(&mut self, ctx: &egui::Context) {
+        if let Some(Ok(data)) = &self.data
+            && let Some(img) = &data.image
+        {
+            for uri in img.uris() {
+                ctx.forget_image(&uri);
+            }
+        }
+        for uri in self.stale_uris.drain(..) {
+            ctx.forget_image(&uri);
+        }
+    }
+
     /// Shows the answer to the read numbered `request`, unless a newer read was made since.
     fn arrived(&mut self, request: u64, result: Result<diff::DiffData, String>) {
         if request != self.request {
             return;
+        }
+        if let Some(Ok(prev)) = &self.data
+            && let Some(img) = &prev.image
+        {
+            self.stale_uris.extend(img.uris());
         }
         self.data = Some(result);
         // The lines may have moved.
@@ -404,6 +439,14 @@ pub struct RepoTab {
     rx: Receiver<Msg>,
 
     loading: bool,
+    reload_queued: bool,
+    load_seq: u64,
+    status_seq: u64,
+    detail_seq: u64,
+    file_seq: u64,
+    search_seq: u64,
+    prs_seq: u64,
+    rebase_seq: u64,
     load_error: Option<String>,
     refs: Refs,
     /// Commits as git listed them.
@@ -420,6 +463,9 @@ pub struct RepoTab {
     stashes: Vec<Stash>,
     remotes: Vec<Remote>,
     identity: Identity,
+    head_message: Option<String>,
+    pub(super) bisect: Option<bisect::Info>,
+    pub(super) stored_issue_rules: Vec<issues::Rule>,
     forge: Option<Forge>,
     prs: Vec<PullRequest>,
     pr_error: Option<String>,
@@ -440,10 +486,12 @@ pub struct RepoTab {
     rebase: Option<rebase::RebaseEditor>,
     /// The selected commit's message, being edited in the right pane.
     reword: Option<Reword>,
-    /// HTTPS credentials typed in this session, used for every later git command of the tab.
-    credentials: Option<git::Credentials>,
-    /// The last operation started, to run again after signing in.
+    /// HTTPS credentials typed in this session, keyed by remote host origin.
+    credentials: HashMap<String, git::Credentials>,
+    /// The last user-initiated operation started, to run again after signing in.
     last_op: Option<PendingOp>,
+    /// Structured checkout target while a checkout is running (for blocked-checkout recovery).
+    pending_checkout: Option<branch_ops::CheckoutTarget>,
     /// The forge has been asked for avatars.
     avatars_hinted: bool,
     diff_ignore_ws: bool,
@@ -483,6 +531,7 @@ pub struct RepoTab {
     fs_rx: Option<Receiver<bool>>,
     /// A change on disk not yet reloaded: (inside .git, when).
     fs_pending: Option<(bool, Instant)>,
+    file_picker: Option<(RepoPicker, crate::file_dialog::PendingDialog)>,
 
     /// Actions queued from outside (the command palette).
     queued: Vec<Action>,
@@ -507,6 +556,14 @@ impl RepoTab {
             tx,
             rx,
             loading: false,
+            reload_queued: false,
+            load_seq: 0,
+            status_seq: 0,
+            detail_seq: 0,
+            file_seq: 0,
+            search_seq: 0,
+            prs_seq: 0,
+            rebase_seq: 0,
             load_error: None,
             refs: Refs::default(),
             history: Vec::new(),
@@ -524,6 +581,9 @@ impl RepoTab {
             stashes: Vec::new(),
             remotes: Vec::new(),
             identity: Identity::default(),
+            head_message: None,
+            bisect: None,
+            stored_issue_rules: Vec::new(),
             forge: None,
             prs: Vec::new(),
             pr_error: None,
@@ -540,8 +600,9 @@ impl RepoTab {
             file_view: None,
             rebase: None,
             reword: None,
-            credentials: None,
+            credentials: HashMap::new(),
             last_op: None,
+            pending_checkout: None,
             avatars_hinted: false,
             diff_ignore_ws: false,
             conflict: None,
@@ -569,6 +630,7 @@ impl RepoTab {
             watcher: None,
             fs_rx: None,
             fs_pending: None,
+            file_picker: None,
             queued: Vec::new(),
             open_request: None,
             keys_blocked: false,
@@ -583,6 +645,10 @@ impl RepoTab {
         self.loading || self.busy_op.is_some()
     }
 
+    pub fn has_dialog(&self) -> bool {
+        self.dialog.is_some() || self.file_picker.is_some()
+    }
+
     /// Queues an action from outside the tab (the command palette).
     pub(crate) fn queue(&mut self, action: Action) {
         self.queued.push(action);
@@ -591,41 +657,63 @@ impl RepoTab {
     /// Re-reads refs, history, working tree, worktrees, stashes and remotes in the background.
     pub fn reload(&mut self, ctx: &egui::Context) {
         if self.loading {
+            self.reload_queued = true;
             return;
         }
         self.loading = true;
+        self.reload_queued = false;
+        self.load_seq = self.load_seq.wrapping_add(1);
+        self.status_seq = self.status_seq.wrapping_add(1);
+        let seq = self.load_seq;
         let path = self.path.clone();
         // Keep the pages already loaded.
         let count = self.history.len().clamp(git::LOG_PAGE, MAX_HISTORY);
         spawn(&self.tx, ctx, move || {
-            Msg::Loaded((|| {
-                let refs = git::refs(&path)?;
-                let history = git::log(&path, 0, count)?;
-                let work = git::status(&path)?;
-                // Very old gits have no `worktree list`; the section just stays empty.
-                let worktrees = git::worktrees(&path).unwrap_or_default();
-                let submodules = submodules::list(&path);
-                let stashes = git::stashes(&path).unwrap_or_default();
-                let remotes = git::remotes(&path).unwrap_or_default();
-                let identity = git::identity(&path);
-                Ok(Box::new(Loaded {
-                    refs,
-                    history,
-                    work,
-                    worktrees,
-                    submodules,
-                    stashes,
-                    remotes,
-                    identity,
-                    requested: count,
-                }))
-            })())
+            Msg::Loaded(
+                seq,
+                (|| {
+                    let refs = git::refs(&path)?;
+                    let history = git::log(&path, 0, count)?;
+                    let work = git::status(&path)?;
+                    // Very old gits have no `worktree list`; the section just stays empty.
+                    let worktrees = git::worktrees(&path).unwrap_or_default();
+                    let submodules = submodules::list(&path);
+                    let stashes = git::stashes(&path).unwrap_or_default();
+                    let remotes = git::remotes(&path).unwrap_or_default();
+                    let identity = git::identity(&path);
+                    let head_message = (!refs.head.is_empty())
+                        .then(|| git::head_message(&path).ok())
+                        .flatten();
+                    let bisect = bisect::read_state(&path, &refs.head);
+                    let issue_rules = issues::read_rules(&path);
+                    Ok(Box::new(Loaded {
+                        refs,
+                        history,
+                        work,
+                        worktrees,
+                        submodules,
+                        stashes,
+                        remotes,
+                        identity,
+                        head_message,
+                        bisect,
+                        issue_rules,
+                        requested: count,
+                    }))
+                })(),
+            )
         });
     }
 
     fn reload_status(&mut self, ctx: &egui::Context) {
+        if self.loading {
+            self.reload_queued = true;
+            return;
+        }
+        self.status_seq = self.status_seq.wrapping_add(1);
+        let seq = self.status_seq;
         let path = self.path.clone();
-        spawn(&self.tx, ctx, move || Msg::Status(git::status(&path)));
+        spawn(&self.tx, ctx, move || Msg::Status(seq, git::status(&path)));
     }
 
     fn load_more(&mut self, ctx: &egui::Context) {
@@ -643,51 +731,103 @@ impl RepoTab {
     fn load_prs(&mut self, ctx: &egui::Context) {
         let Some(forge) = self.forge else { return };
         self.prs_loaded = Some(Instant::now());
+        self.prs_seq = self.prs_seq.wrapping_add(1);
+        let seq = self.prs_seq;
         let path = self.path.clone();
-        spawn(&self.tx, ctx, move || Msg::Prs(forge::list(&path, forge)));
+        spawn(&self.tx, ctx, move || Msg::Prs(seq, forge::list(&path, forge)));
     }
 
-    /// Watches the folder so changes made elsewhere (editor, terminal) show up by themselves.
+    /// Watches the folder (and resolved git dir for linked worktrees) in the background so
+    /// external changes show up without blocking tab opening.
     fn watch(&mut self, ctx: &egui::Context) {
         use notify::Watcher;
-        let (tx, rx) = channel();
-        let ctx = ctx.clone();
-        let handler = move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            if matches!(event.kind, notify::EventKind::Access(_)) {
-                return;
-            }
-            for path in &event.paths {
-                let s = path.to_string_lossy().replace('\\', "/");
-                match s.split_once("/.git/") {
-                    // Refs, HEAD, the index and merge state matter; objects and logs don't.
-                    Some((_, inside)) => {
-                        let relevant = inside.starts_with("refs")
-                            || inside == "HEAD"
-                            || inside == "index"
-                            || inside == "packed-refs"
-                            || inside.ends_with("_HEAD")
-                            || inside.starts_with("rebase-");
-                        if relevant {
-                            let _ = tx.send(true);
-                            ctx.request_repaint_after(Duration::from_millis(500));
+        let path = self.path.clone();
+        let msg_tx = self.tx.clone();
+        let ctx_watch = ctx.clone();
+        std::thread::spawn(move || {
+            let resolve_dir = |arg: &str| -> Option<PathBuf> {
+                let raw = git::run(Some(&path), &["rev-parse", arg]).ok()?;
+                let p = PathBuf::from(raw.trim_end_matches(['\r', '\n']));
+                let full = if p.is_absolute() { p } else { path.join(p) };
+                Some(std::fs::canonicalize(&full).unwrap_or(full))
+            };
+            let git_dir = resolve_dir("--git-dir");
+            let common_dir = resolve_dir("--git-common-dir");
+            let work_root = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let norm_dir = |p: &Path| -> String {
+                let s = p.to_string_lossy().replace('\\', "/");
+                format!("{}/", s.trim_end_matches('/'))
+            };
+            let git_dir_norm = git_dir.as_deref().map(norm_dir);
+            let common_dir_norm = common_dir.as_deref().map(norm_dir);
+
+            let (tx, rx) = channel();
+            let ctx_ev = ctx_watch.clone();
+            let handler = move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                if matches!(event.kind, notify::EventKind::Access(_)) {
+                    return;
+                }
+                for p in &event.paths {
+                    let s = p.to_string_lossy().replace('\\', "/");
+                    let inside = s
+                        .split_once("/.git/")
+                        .map(|(_, rest)| rest)
+                        .or_else(|| {
+                            git_dir_norm
+                                .as_deref()
+                                .and_then(|g| s.strip_prefix(g))
+                                .map(|rest| rest.trim_start_matches('/'))
+                        })
+                        .or_else(|| {
+                            common_dir_norm
+                                .as_deref()
+                                .and_then(|g| s.strip_prefix(g))
+                                .map(|rest| rest.trim_start_matches('/'))
+                        });
+                    match inside {
+                        // Refs, HEAD, the index and merge/rebase state matter; locks/objects/logs don't.
+                        Some(inside) => {
+                            if inside.ends_with(".lock") {
+                                continue;
+                            }
+                            let relevant = inside.starts_with("refs")
+                                || inside == "HEAD"
+                                || inside == "index"
+                                || inside == "packed-refs"
+                                || inside.ends_with("_HEAD")
+                                || inside.starts_with("rebase-")
+                                || inside.starts_with("MERGE_")
+                                || inside.starts_with("BISECT_");
+                            if relevant {
+                                let _ = tx.send(true);
+                                ctx_ev.request_repaint_after(Duration::from_millis(500));
+                            }
+                        }
+                        None => {
+                            let _ = tx.send(false);
+                            ctx_ev.request_repaint_after(Duration::from_millis(500));
                         }
                     }
-                    None => {
-                        let _ = tx.send(false);
-                        ctx.request_repaint_after(Duration::from_millis(500));
-                    }
+                }
+            };
+            let Ok(mut watcher) = notify::recommended_watcher(handler) else {
+                return;
+            };
+            if watcher
+                .watch(&path, notify::RecursiveMode::Recursive)
+                .is_err()
+            {
+                return;
+            }
+            for extra in [git_dir.as_ref(), common_dir.as_ref()].into_iter().flatten() {
+                if !extra.starts_with(&work_root) && extra.is_dir() {
+                    let _ = watcher.watch(extra, notify::RecursiveMode::Recursive);
                 }
             }
-        };
-        if let Ok(mut watcher) = notify::recommended_watcher(handler)
-            && watcher
-                .watch(&self.path, notify::RecursiveMode::Recursive)
-                .is_ok()
-        {
-            self.watcher = Some(watcher);
-            self.fs_rx = Some(rx);
-        }
+            let _ = msg_tx.send(Msg::WatcherReady(watcher, rx));
+            ctx_watch.request_repaint();
+        });
     }
 
     fn is_wip(&self, row: usize) -> bool {
@@ -785,6 +925,8 @@ impl RepoTab {
         }
 
         // The diff of a file that's no longer listed (staged, committed…) is stale.
+        // Preserve an active ConflictEditor while the file remains conflicted so background reloads
+        // do not discard the user's edits or button choices.
         if let Some(DiffView {
             key: DiffKey::Work(file),
             ..
@@ -797,13 +939,21 @@ impl RepoTab {
                 .chain(&self.work.unstaged)
                 .chain(&self.work.conflicted)
                 .any(|f| f == file);
+            let keeping_conflict = still
+                && file.area == git::Area::Conflicted
+                && self
+                    .conflict
+                    .as_ref()
+                    .is_some_and(|c| c.path == file.path);
             let key = DiffKey::Work(file.clone());
-            if still && file.area != git::Area::Conflicted {
+            if keeping_conflict {
+                // Keep the open conflict editor untouched.
+            } else if still && file.area != git::Area::Conflicted {
                 // Shown as it was until the new diff is read (no flicker after staging lines).
+                self.conflict = None;
                 self.refresh_diff(ctx);
             } else {
-                self.diff = None;
-                self.conflict = None;
+                self.clear_diff(ctx);
                 if still {
                     self.open_diff(key, ctx);
                 }
@@ -813,6 +963,13 @@ impl RepoTab {
         if let Some(hash) = self.pending_goto.clone() {
             self.goto(&hash, ctx);
         }
+    }
+
+    fn clear_diff(&mut self, ctx: &egui::Context) {
+        if let Some(mut view) = self.diff.take() {
+            view.forget_images(ctx);
+        }
+        self.conflict = None;
     }
 
     fn select(&mut self, row: usize, ctx: &egui::Context) {
@@ -836,8 +993,7 @@ impl RepoTab {
             })
         ) || hash != WIP_HASH
         {
-            self.diff = None;
-            self.conflict = None;
+            self.clear_diff(ctx);
         }
         if hash == WIP_HASH {
             self.detail = None;
@@ -852,10 +1008,12 @@ impl RepoTab {
         self.reword = None;
         self.detail_error = None;
         self.detail_hash = Some(hash.clone());
+        self.detail_seq = self.detail_seq.wrapping_add(1);
+        let seq = self.detail_seq;
         let path = self.path.clone();
         spawn(&self.tx, ctx, move || {
             let detail = git::commit_detail(&path, &hash);
-            Msg::Detail(hash, detail)
+            Msg::Detail(seq, hash, detail)
         });
     }
 
@@ -869,8 +1027,7 @@ impl RepoTab {
         self.scroll_to = self.selected;
         self.file_view = None;
         self.compare = None;
-        self.diff = None;
-        self.conflict = None;
+        self.clear_diff(ctx);
         self.load_detail(hash, ctx);
     }
 
@@ -910,10 +1067,10 @@ impl RepoTab {
     /// closes it.
     fn open_diff(&mut self, key: DiffKey, ctx: &egui::Context) {
         if self.diff.as_ref().is_some_and(|d| d.key == key) {
-            self.diff = None;
-            self.conflict = None;
+            self.clear_diff(ctx);
             return;
         }
+        self.clear_diff(ctx);
         self.conflict = match &key {
             DiffKey::Work(file) if file.area == git::Area::Conflicted => {
                 conflict::ConflictEditor::open(&self.path, &file.path, self.work.in_progress)
@@ -950,7 +1107,7 @@ impl RepoTab {
                 ..
             })
         ) {
-            self.diff = None;
+            self.clear_diff(ctx);
         }
         self.file_view = None;
         self.compare = Some(compare);
@@ -1002,8 +1159,7 @@ impl RepoTab {
         tab: file_view::FileTab,
         ctx: &egui::Context,
     ) {
-        self.diff = None;
-        self.conflict = None;
+        self.clear_diff(ctx);
         let view = match self.file_view.take() {
             Some(mut v) if v.path == path && v.rev == rev => {
                 v.tab = tab;
@@ -1016,17 +1172,19 @@ impl RepoTab {
         if !needs {
             return;
         }
+        self.file_seq = self.file_seq.wrapping_add(1);
+        let seq = self.file_seq;
         let repo = self.path.clone();
         match tab {
             file_view::FileTab::History => spawn(&self.tx, ctx, move || {
                 let result = git::file_history(&repo, rev.as_deref(), &path);
-                Msg::FileHistory(path, result)
+                Msg::FileHistory(seq, path, result)
             }),
             file_view::FileTab::Blame => {
                 let dark = Tokens::get(ctx).dark();
                 spawn(&self.tx, ctx, move || {
                     let result = file_view::load_blame(&repo, rev.as_deref(), &path, dark);
-                    Msg::Blame(path, rev, result)
+                    Msg::Blame(seq, path, rev, result)
                 })
             }
         }
@@ -1051,6 +1209,42 @@ impl RepoTab {
         self.run_ops_ex(label, ops, refresh, kind, false, ctx);
     }
 
+    fn op_remote_url(&self, ops: &[Vec<String>]) -> String {
+        for op in ops {
+            let cmd = op.first().map(String::as_str).unwrap_or("");
+            if matches!(cmd, "fetch" | "pull" | "push" | "ls-remote") {
+                for arg in op.iter().skip(1) {
+                    if arg.starts_with('-') {
+                        continue;
+                    }
+                    if arg.contains("://") || arg.contains('@') {
+                        return arg.clone();
+                    }
+                    if let Some(r) = self.remotes.iter().find(|r| r.name == *arg) {
+                        return r.url.clone();
+                    }
+                    if let Some((remote, _)) = arg.split_once('/')
+                        && let Some(r) = self.remotes.iter().find(|r| r.name == remote)
+                    {
+                        return r.url.clone();
+                    }
+                }
+            }
+        }
+        if let Some(cur) = self.refs.current.as_deref()
+            && let Some(b) = self.refs.local.iter().find(|b| b.name == cur)
+            && !b.upstream.is_empty()
+            && let Some((remote, _)) = b.upstream.split_once('/')
+            && let Some(r) = self.remotes.iter().find(|r| r.name == remote)
+        {
+            return r.url.clone();
+        }
+        self.default_remote()
+            .and_then(|name| self.remotes.iter().find(|r| r.name == name))
+            .map(|r| r.url.clone())
+            .unwrap_or_default()
+    }
+
     fn run_ops_ex(
         &mut self,
         label: &str,
@@ -1063,27 +1257,32 @@ impl RepoTab {
         if self.busy_op.is_some() {
             return;
         }
+        let remote_url = self.op_remote_url(&ops);
+        let cred_key = credential_key(&remote_url);
+        let creds = self.credentials.get(&cred_key).cloned();
         self.busy_op = Some(label.to_owned());
         self.op_started = Some(Instant::now());
         if !quiet {
             self.status = None;
+            self.last_op = Some(PendingOp {
+                label: label.to_owned(),
+                ops: ops.clone(),
+                refresh,
+                kind: kind.clone(),
+                quiet,
+                remote_url,
+            });
         }
-        self.last_op = Some(PendingOp {
-            label: label.to_owned(),
-            ops: ops.clone(),
-            refresh,
-            kind: kind.clone(),
-            quiet,
-        });
         let path = self.path.clone();
         let label = label.to_owned();
-        let creds = self.credentials.clone();
         spawn(&self.tx, ctx, move || {
             let mut result = Ok(String::new());
-            for op in &ops {
+            let mut failed_step = None;
+            for (idx, op) in ops.iter().enumerate() {
                 let args: Vec<&str> = op.iter().map(String::as_str).collect();
                 result = git::run_with(Some(&path), &args, creds.as_ref());
                 if result.is_err() {
+                    failed_step = Some(idx);
                     break;
                 }
             }
@@ -1103,6 +1302,7 @@ impl RepoTab {
                 refresh,
                 kind,
                 quiet,
+                failed_step,
             }
         });
     }
@@ -1121,6 +1321,14 @@ impl RepoTab {
     }
 
     fn checkout(&mut self, target: &str, ctx: &egui::Context) {
+        if self.busy_op.is_some() {
+            return;
+        }
+        if target.is_empty() || target.starts_with('-') {
+            self.status = Some(("Invalid checkout target".to_owned(), true));
+            return;
+        }
+        self.pending_checkout = Some(branch_ops::CheckoutTarget::Branch(target.to_owned()));
         let previous = self
             .refs
             .current
@@ -1145,6 +1353,13 @@ impl RepoTab {
 
     /// Checkout and `pull --ff-only`; undoing goes back and puts the branch where it was.
     fn checkout_pull(&mut self, branch: &str, ctx: &egui::Context) {
+        if self.busy_op.is_some() {
+            return;
+        }
+        if branch.is_empty() || branch.starts_with('-') {
+            self.status = Some(("Invalid branch name".to_owned(), true));
+            return;
+        }
         let previous = self
             .refs
             .current
@@ -1159,6 +1374,7 @@ impl RepoTab {
         else {
             return self.checkout(branch, ctx);
         };
+        self.pending_checkout = Some(branch_ops::CheckoutTarget::Pull(branch.to_owned()));
         let run = ops(&[&["checkout", branch], &["pull", "--ff-only"]]);
         let undo = if previous.is_empty() {
             Undo::None
@@ -1181,6 +1397,10 @@ impl RepoTab {
     /// reworded by an interactive rebase from its parent.
     fn reword_commit(&mut self, hash: String, message: String, ctx: &egui::Context) {
         if self.busy_op.is_some() {
+            return;
+        }
+        if self.work.in_progress.is_some() {
+            self.status = Some(("Finish the operation in progress before editing a commit message".to_owned(), true));
             return;
         }
         self.reword = None;
@@ -1215,10 +1435,13 @@ impl RepoTab {
             ));
             return;
         }
+        self.rebase_seq = self.rebase_seq.wrapping_add(1);
+        let seq = self.rebase_seq;
         let path = self.path.clone();
         spawn(&self.tx, ctx, move || {
             let result = git::rebase_commits(&path, &format!("{hash}^"));
             Msg::RewordCommits {
+                seq,
                 hash,
                 message,
                 result,
@@ -1227,16 +1450,31 @@ impl RepoTab {
     }
 
     fn checkout_remote(&mut self, remote_branch: &str, ctx: &egui::Context) {
+        if self.busy_op.is_some() {
+            return;
+        }
+        if remote_branch.is_empty() || remote_branch.starts_with('-') {
+            self.status = Some(("Invalid remote branch".to_owned(), true));
+            return;
+        }
         // `origin/feature` → local `feature` tracking it (or just switch if it exists).
         let local = remote_branch
             .split_once('/')
             .map(|(_, b)| b)
             .unwrap_or(remote_branch)
             .to_owned();
+        if local.is_empty() || local.starts_with('-') {
+            self.status = Some(("Invalid branch name".to_owned(), true));
+            return;
+        }
         if self.refs.local.iter().any(|b| b.name == local) {
             self.checkout(&local, ctx);
             return;
         }
+        self.pending_checkout = Some(branch_ops::CheckoutTarget::Remote {
+            remote_branch: remote_branch.to_owned(),
+            local: local.clone(),
+        });
         let previous = self
             .refs
             .current
@@ -1293,9 +1531,9 @@ impl RepoTab {
         });
     }
 
-    /// HTTPS credentials for this tab's git commands (from the clone that made it).
-    pub fn set_credentials(&mut self, creds: git::Credentials) {
-        self.credentials = Some(creds);
+    /// HTTPS credentials for this tab's git commands, scoped to `remote_url`'s origin.
+    pub fn set_credentials(&mut self, remote_url: &str, creds: git::Credentials) {
+        self.credentials.insert(credential_key(remote_url), creds);
     }
 
     fn default_remote(&self) -> Option<String> {
@@ -1343,13 +1581,24 @@ impl RepoTab {
     }
 
     fn commit(&mut self, ctx: &egui::Context) {
+        if !self.work.conflicted.is_empty() {
+            self.status = Some(("Resolve the conflicted files first".to_owned(), true));
+            return;
+        }
+        // A rebase stopped on conflicts finishes with `rebase --continue`, not a new commit.
+        if self.work.in_progress == Some(InProgress::Rebase) {
+            self.run_ops(
+                "Continue rebase",
+                vec![vec!["rebase".to_owned(), "--continue".to_owned()]],
+                Refresh::All,
+                OpKind::Normal(Undo::None, String::new()),
+                ctx,
+            );
+            return;
+        }
         let summary = self.commit_summary.trim();
         if summary.is_empty() {
             self.status = Some(("Write a commit summary first".to_owned(), true));
-            return;
-        }
-        if !self.work.conflicted.is_empty() {
-            self.status = Some(("Resolve the conflicted files first".to_owned(), true));
             return;
         }
         let mut commit = vec!["commit".to_owned()];
@@ -1362,18 +1611,6 @@ impl RepoTab {
             commit.extend(["-m".to_owned(), body.to_owned()]);
         }
         let mut steps = Vec::new();
-        // A rebase stopped on conflicts finishes with `rebase --continue`, not a new commit.
-        if self.work.in_progress == Some(InProgress::Rebase) {
-            steps.push(vec!["rebase".to_owned(), "--continue".to_owned()]);
-            self.run_ops(
-                "Continue rebase",
-                steps,
-                Refresh::All,
-                OpKind::Normal(Undo::None, String::new()),
-                ctx,
-            );
-            return;
-        }
         // Nothing staged: commit everything, like "Stage all and commit" (an amend with
         // nothing staged only rewrites the message).
         if self.work.staged.is_empty() && !self.amend {
@@ -1439,6 +1676,8 @@ impl RepoTab {
             self.search.searched.clear();
             return;
         }
+        self.search_seq = self.search_seq.wrapping_add(1);
+        let seq = self.search_seq;
         self.search.running = true;
         let path = self.path.clone();
         let code = self.search.code;
@@ -1448,7 +1687,7 @@ impl RepoTab {
             } else {
                 git::search(&path, &query)
             };
-            Msg::Search(query, result)
+            Msg::Search(seq, query, result)
         });
     }
 
@@ -1486,10 +1725,88 @@ impl RepoTab {
         }
     }
 
+    pub(super) fn pick_worktree_dir(&mut self, ctx: &egui::Context) {
+        if self.file_picker.is_some() {
+            return;
+        }
+        let dialog = rfd::AsyncFileDialog::new().set_title("Worktree folder");
+        self.file_picker = Some((
+            RepoPicker::WorktreeDir,
+            crate::file_dialog::PendingDialog::pick_folder(dialog, ctx),
+        ));
+    }
+
+    pub(super) fn pick_apply_patch(&mut self, ctx: &egui::Context) {
+        if self.file_picker.is_some() {
+            return;
+        }
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title("Choose a patch")
+            .add_filter("Patch", &["patch", "diff", "txt"]);
+        self.file_picker = Some((
+            RepoPicker::ApplyPatch,
+            crate::file_dialog::PendingDialog::pick_file(dialog, ctx),
+        ));
+    }
+
+    pub(super) fn pick_save_patch(
+        &mut self,
+        source: patch::PatchSource,
+        suggested: &str,
+        ctx: &egui::Context,
+    ) {
+        if self.file_picker.is_some() {
+            return;
+        }
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title("Save patch")
+            .set_file_name(suggested)
+            .add_filter("Patch", &["patch", "diff"]);
+        self.file_picker = Some((
+            RepoPicker::SavePatch(source),
+            crate::file_dialog::PendingDialog::save_file(dialog, ctx),
+        ));
+    }
+
+    fn poll_file_picker(&mut self, ctx: &egui::Context) {
+        let Some((target, mut pending)) = self.file_picker.take() else {
+            return;
+        };
+        let Some(picked) = pending.poll() else {
+            self.file_picker = Some((target, pending));
+            return;
+        };
+        if let Some(path) = picked {
+            match target {
+                RepoPicker::WorktreeDir => {
+                    if let Some(Dialog::AddWorktree {
+                        path: wt_path,
+                        path_edited,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        *wt_path = path.display().to_string();
+                        *path_edited = true;
+                    }
+                }
+                RepoPicker::ApplyPatch => {
+                    if let Some(Dialog::Apply(apply)) = &mut self.dialog {
+                        apply.file = path.display().to_string();
+                    }
+                }
+                RepoPicker::SavePatch(source) => self.save_patch_to(source, path, ctx),
+            }
+        }
+    }
+
     /// Drains finished background work and file-system events.
     pub fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             self.handle(msg, ctx);
+        }
+        self.poll_file_picker(ctx);
+        if !self.terminals.is_empty() {
+            self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
         }
 
         // Changes on disk, debounced.
@@ -1499,24 +1816,35 @@ impl RepoTab {
                 self.fs_pending = Some((was || git_dir, Instant::now()));
             }
         }
-        if let Some((git_dir, at)) = self.fs_pending
-            && at.elapsed() > Duration::from_millis(400)
-            && !self.loading
-            && self.busy_op.is_none()
-        {
-            self.fs_pending = None;
-            if git_dir {
-                self.reload(ctx);
+        if let Some((git_dir, at)) = self.fs_pending {
+            if at.elapsed() > Duration::from_millis(400)
+                && !self.loading
+                && self.busy_op.is_none()
+            {
+                self.fs_pending = None;
+                if git_dir {
+                    self.reload(ctx);
+                } else {
+                    self.reload_status(ctx);
+                }
             } else {
-                self.reload_status(ctx);
+                // Keep waking until the debounce window closes and no op/load blocks reload.
+                ctx.request_repaint_after(Duration::from_millis(200));
             }
         }
 
-        // Background fetch.
+        // Background fetch (paused while a modal, rebase, conflict editor, or op is active).
         let minutes = Settings::get(ctx).auto_fetch_minutes;
+        let blocked = self.has_dialog()
+            || self.busy_op.is_some()
+            || self.loading
+            || self.rebase.is_some()
+            || self.conflict.is_some()
+            || self.work.in_progress.is_some()
+            || self.push_follow != ext::PushFollow::Idle;
         if minutes > 0
             && !self.remotes.is_empty()
-            && self.busy_op.is_none()
+            && !blocked
             && self.last_fetch.elapsed() > Duration::from_secs(u64::from(minutes) * 60)
         {
             self.last_fetch = Instant::now();
@@ -1545,7 +1873,10 @@ impl RepoTab {
 
     fn handle(&mut self, msg: Msg, ctx: &egui::Context) {
         match msg {
-            Msg::Loaded(result) => {
+            Msg::Loaded(seq, result) => {
+                if seq != self.load_seq {
+                    return;
+                }
                 self.loading = false;
                 match result {
                     Ok(loaded) => {
@@ -1566,6 +1897,10 @@ impl RepoTab {
                         self.stash_view =
                             viewed.and_then(|h| self.stashes.iter().position(|s| s.hash == h));
                         self.identity = loaded.identity;
+                        self.head_message = loaded.head_message;
+                        self.bisect = loaded.bisect;
+                        self.stored_issue_rules = loaded.issue_rules;
+                        self.forget_issue_rules(ctx);
                         let forge = forge::detect(&loaded.remotes);
                         self.remotes = loaded.remotes;
                         if forge != self.forge {
@@ -1584,6 +1919,9 @@ impl RepoTab {
                         self.reload_compare(ctx);
                     }
                     Err(e) => self.load_error = Some(e),
+                }
+                if std::mem::take(&mut self.reload_queued) {
+                    self.reload(ctx);
                 }
             }
             Msg::More(result) => {
@@ -1604,19 +1942,24 @@ impl RepoTab {
                     Err(e) => self.status = Some((e, true)),
                 }
             }
-            Msg::Status(result) => match result {
-                Ok(work) => {
-                    self.work = work;
-                    self.prune_patch_selection();
-                    self.rebuild(ctx);
-                    if self.compare.as_ref().is_some_and(|c| c.target.is_none()) {
-                        self.reload_compare(ctx);
-                    }
+            Msg::Status(seq, result) => {
+                if seq != self.status_seq {
+                    return;
                 }
-                Err(e) => self.status = Some((e, true)),
-            },
-            Msg::Detail(hash, result) => {
-                if self.detail_hash.as_deref() == Some(hash.as_str()) {
+                match result {
+                    Ok(work) => {
+                        self.work = work;
+                        self.prune_patch_selection();
+                        self.rebuild(ctx);
+                        if self.compare.as_ref().is_some_and(|c| c.target.is_none()) {
+                            self.reload_compare(ctx);
+                        }
+                    }
+                    Err(e) => self.status = Some((e, true)),
+                }
+            }
+            Msg::Detail(seq, hash, result) => {
+                if seq == self.detail_seq && self.detail_hash.as_deref() == Some(hash.as_str()) {
                     match result {
                         Ok(d) => self.detail = Some(d),
                         Err(e) => self.detail_error = Some(e),
@@ -1627,31 +1970,44 @@ impl RepoTab {
                 }
             }
             Msg::RebaseCommits {
+                seq,
                 onto,
                 label,
                 result,
-            } => match result {
-                Ok(commits) if commits.is_empty() => {
-                    self.status = Some((
-                        format!(
-                            "Nothing to rebase: {label} already contains every commit of this branch"
-                        ),
-                        true,
-                    ));
+            } => {
+                if seq != self.rebase_seq || self.work.in_progress.is_some() {
+                    return;
                 }
-                Ok(commits) => {
-                    self.diff = None;
-                    self.conflict = None;
-                    self.file_view = None;
-                    self.rebase = Some(rebase::RebaseEditor::new(onto, label, commits));
+                match result {
+                    Ok(commits) if commits.is_empty() => {
+                        self.status = Some((
+                            format!(
+                                "Nothing to rebase: {label} already contains every commit of this branch"
+                            ),
+                            true,
+                        ));
+                    }
+                    Ok(commits) => {
+                        self.clear_diff(ctx);
+                        self.file_view = None;
+                        self.rebase = Some(rebase::RebaseEditor::new(onto, label, commits));
+                    }
+                    Err(e) => self.status = Some((format!("Interactive rebase: {e}"), true)),
                 }
-                Err(e) => self.status = Some((format!("Interactive rebase: {e}"), true)),
-            },
+            }
             Msg::RewordCommits {
+                seq,
                 hash,
                 message,
                 result,
             } => {
+                if seq != self.rebase_seq
+                    || self.busy_op.is_some()
+                    || self.work.in_progress.is_some()
+                    || !self.work.staged.is_empty()
+                {
+                    return;
+                }
                 let result = result.and_then(|commits| {
                     let onto = format!("{hash}^");
                     let mut editor =
@@ -1679,15 +2035,17 @@ impl RepoTab {
                     Err(e) => self.status = Some((format!("Edit message: {e}"), true)),
                 }
             }
-            Msg::FileHistory(path, result) => {
-                if let Some(view) = &mut self.file_view
+            Msg::FileHistory(seq, path, result) => {
+                if seq == self.file_seq
+                    && let Some(view) = &mut self.file_view
                     && view.path == path
                 {
                     view.history = Some(result);
                 }
             }
-            Msg::Blame(path, rev, result) => {
-                if let Some(view) = &mut self.file_view
+            Msg::Blame(seq, path, rev, result) => {
+                if seq == self.file_seq
+                    && let Some(view) = &mut self.file_view
                     && view.path == path
                     && view.rev == rev
                 {
@@ -1706,8 +2064,8 @@ impl RepoTab {
                     c.data = Some(result);
                 }
             }
-            Msg::Search(query, result) => {
-                if query == self.search.query.trim() {
+            Msg::Search(seq, query, result) => {
+                if seq == self.search_seq && query == self.search.query.trim() {
                     self.search.running = false;
                     self.search.searched = query;
                     match result {
@@ -1723,27 +2081,40 @@ impl RepoTab {
                     }
                 }
             }
-            Msg::Prs(result) => match result {
-                Ok(prs) => {
-                    self.prs = prs;
-                    self.pr_error = None;
+            Msg::Prs(seq, result) => {
+                if seq == self.prs_seq {
+                    match result {
+                        Ok(prs) => {
+                            self.prs = prs;
+                            self.pr_error = None;
+                        }
+                        Err(e) => self.pr_error = Some(e),
+                    }
                 }
-                Err(e) => self.pr_error = Some(e),
-            },
+            }
+            Msg::WatcherReady(watcher, rx) => {
+                self.watcher = Some(watcher);
+                self.fs_rx = Some(rx);
+            }
             Msg::OpDone {
                 label,
                 result,
                 refresh,
                 kind,
                 quiet,
+                failed_step,
             } => {
                 self.busy_op = None;
+                let checkout_target = self.pending_checkout.take();
                 let long = self
                     .op_started
                     .take()
                     .is_some_and(|t| t.elapsed() > LONG_OP);
                 match &result {
                     Ok(_) => {
+                        if !quiet {
+                            self.last_op = None;
+                        }
                         if label == "Commit" || label == "Amend" || label == "Continue rebase" {
                             self.commit_summary.clear();
                             self.commit_body.clear();
@@ -1759,22 +2130,48 @@ impl RepoTab {
                         self.record_undo(&label, kind);
                     }
                     Err(e) if git::is_auth_error(e) && !quiet => {
-                        // Typed credentials that were refused are forgotten.
-                        let refused = self.credentials.take().is_some();
-                        self.status = Some((format!("{label}: sign-in needed"), true));
+                        if let Some(step) = failed_step
+                            && let Some(op) = &mut self.last_op
+                        {
+                            let idx = step.min(op.ops.len());
+                            if idx > 0 {
+                                op.ops = op.ops.split_off(idx);
+                            }
+                        }
                         let url = self
-                            .default_remote()
-                            .and_then(|r| self.remotes.iter().find(|x| x.name == r))
-                            .map(|r| r.url.clone())
+                            .last_op
+                            .as_ref()
+                            .map(|o| o.remote_url.clone())
+                            .filter(|u| !u.is_empty())
+                            .or_else(|| {
+                                self.default_remote()
+                                    .and_then(|r| self.remotes.iter().find(|x| x.name == r))
+                                    .map(|r| r.url.clone())
+                            })
                             .unwrap_or_default();
+                        let refused = self.credentials.remove(&credential_key(&url)).is_some();
+                        self.status = Some((format!("{label}: sign-in needed"), true));
                         self.dialog = Some(Dialog::credentials(&url, refused));
                     }
                     Err(e) => {
-                        if let Some(dialog) = branch_ops::blocked_checkout(&label, e) {
-                            self.dialog = Some(dialog);
+                        if !quiet {
+                            if let Some(step) = failed_step
+                                && let Some(op) = &mut self.last_op
+                            {
+                                let idx = step.min(op.ops.len());
+                                if idx > 0 {
+                                    op.ops = op.ops.split_off(idx);
+                                }
+                            }
+                            if let Some(dialog) =
+                                branch_ops::blocked_checkout_for(checkout_target, &label, e)
+                            {
+                                self.dialog = Some(dialog);
+                            }
+                            self.focus_wip =
+                                e.contains("CONFLICT") || e.contains("could not apply");
+                            self.status = Some((format!("{label} failed: {e}"), true));
                         }
-                        self.focus_wip = e.contains("CONFLICT") || e.contains("could not apply");
-                        self.status = Some((format!("{label} failed: {e}"), true));
                         // A failed undo stays undoable.
                         match kind {
                             OpKind::Undo(entry) => self.undo_stack.push(entry),
@@ -1841,8 +2238,7 @@ impl RepoTab {
             Action::SelectStash(i) => self.select_stash(i, ctx),
             Action::OpenDiff(key) => self.open_diff(key, ctx),
             Action::CloseDiff => {
-                self.diff = None;
-                self.conflict = None;
+                self.clear_diff(ctx);
             }
             Action::Ops {
                 label,
@@ -1894,6 +2290,9 @@ impl RepoTab {
             Action::CloseTerminal(i) => {
                 if i < self.terminals.len() {
                     self.terminals.remove(i);
+                    if i < self.active_terminal {
+                        self.active_terminal -= 1;
+                    }
                 }
                 self.active_terminal = self
                     .active_terminal
@@ -1902,7 +2301,11 @@ impl RepoTab {
                     self.terminal_open = false;
                 }
             }
-            Action::SelectTerminal(i) => self.active_terminal = i,
+            Action::SelectTerminal(i) => {
+                if i < self.terminals.len() {
+                    self.active_terminal = i;
+                }
+            }
             Action::ToggleSearch => {
                 self.search.open = !self.search.open;
                 self.search.focus = self.search.open;
@@ -1924,13 +2327,46 @@ impl RepoTab {
                 if self.busy_op.is_some() {
                     return;
                 }
+                let branch = branch.trim().to_owned();
+                let base = base.trim().to_owned();
+                let title = title.trim().to_owned();
+                if branch.is_empty()
+                    || base.is_empty()
+                    || title.is_empty()
+                    || branch.starts_with('-')
+                    || base.starts_with('-')
+                {
+                    self.status = Some(("Invalid pull request parameters".to_owned(), true));
+                    return;
+                }
+                let remote_name = self
+                    .refs
+                    .local
+                    .iter()
+                    .find(|b| b.name == branch && !b.upstream.is_empty() && !b.upstream_gone())
+                    .and_then(|b| b.upstream.split_once('/').map(|(r, _)| r.to_owned()))
+                    .or_else(|| self.default_remote())
+                    .unwrap_or_else(|| "origin".to_owned());
+                let remote_url = self
+                    .remotes
+                    .iter()
+                    .find(|r| r.name == remote_name)
+                    .map(|r| r.url.clone())
+                    .unwrap_or_default();
+                let creds = self.credentials.get(&credential_key(&remote_url)).cloned();
                 let label = format!("Create {}", forge.noun());
                 self.busy_op = Some(label.clone());
                 self.op_started = Some(Instant::now());
+                self.status = None;
+                self.last_op = None;
                 let path = self.path.clone();
                 spawn(&self.tx, ctx, move || {
                     // Publish the branch first, so the forge can see it.
-                    let pushed = git::run(Some(&path), &["push", "-u", "origin", &branch]);
+                    let pushed = git::run_with(
+                        Some(&path),
+                        &["push", "-u", &remote_name, &branch],
+                        creds.as_ref(),
+                    );
                     let result = pushed.and_then(|_| {
                         forge::create(&path, forge, &branch, &base, &title, &body, draft)
                     });
@@ -1940,14 +2376,25 @@ impl RepoTab {
                         refresh: Refresh::All,
                         kind: OpKind::Normal(Undo::None, String::new()),
                         quiet: false,
+                        failed_step: None,
                     }
                 });
             }
             Action::OpenUrl(url) => {
-                let _ = open::that_detached(url);
+                if (url.starts_with("https://") || url.starts_with("http://"))
+                    && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    let _ = open::that_detached(url);
+                }
             }
             Action::OpenPath(rel) => {
-                let _ = open::that_detached(self.path.join(rel));
+                if !rel.is_absolute()
+                    && !rel
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    let _ = open::that_detached(self.path.join(rel));
+                }
             }
             Action::OpenInEditor(rel) => {
                 let editor = Settings::get(ctx).editor;
@@ -1985,10 +2432,17 @@ impl RepoTab {
             Action::FileView { path, rev, tab } => self.open_file_view(path, rev, tab, ctx),
             Action::CloseFileView => self.file_view = None,
             Action::InteractiveRebase { onto, label } => {
+                if self.work.in_progress.is_some() {
+                    self.status = Some(("Finish the operation in progress before rebasing".to_owned(), true));
+                    return;
+                }
+                self.rebase_seq = self.rebase_seq.wrapping_add(1);
+                let seq = self.rebase_seq;
                 let path = self.path.clone();
                 spawn(&self.tx, ctx, move || {
                     let result = git::rebase_commits(&path, &onto);
                     Msg::RebaseCommits {
+                        seq,
                         onto,
                         label,
                         result,
@@ -2004,6 +2458,14 @@ impl RepoTab {
                 self.run_ops("Fetch", vec![args], Refresh::All, plain, ctx)
             }
             Action::RunRebase => {
+                if !self.work.staged.is_empty() || !self.work.conflicted.is_empty() {
+                    self.status = Some((
+                        "Commit, unstage, or resolve staged/conflicted changes before rebasing"
+                            .to_owned(),
+                        true,
+                    ));
+                    return;
+                }
                 let Some(editor) = &self.rebase else { return };
                 if editor.problem().is_some() || self.busy_op.is_some() {
                     return;
@@ -2025,8 +2487,16 @@ impl RepoTab {
             }
             Action::CloseRebase => self.rebase = None,
             Action::SignIn(creds) => {
-                self.credentials = Some(creds);
                 if let Some(op) = self.last_op.take() {
+                    let key = if op.remote_url.is_empty() {
+                        self.default_remote()
+                            .and_then(|r| self.remotes.iter().find(|x| x.name == r))
+                            .map(|r| credential_key(&r.url))
+                            .unwrap_or_else(|| "__default__".to_owned())
+                    } else {
+                        credential_key(&op.remote_url)
+                    };
+                    self.credentials.insert(key, creds);
                     self.run_ops_ex(&op.label, op.ops, op.refresh, op.kind, op.quiet, ctx);
                 }
             }
@@ -2034,13 +2504,23 @@ impl RepoTab {
                 Err(e) => self.status = Some((e, true)),
                 Ok(added) => {
                     if git::is_tracked(&self.path, &path) {
-                        self.run_ops(
-                            &format!("Ignore {pattern}"),
+                        self.reload_status(ctx);
+                        let is_dir = self.path.join(&path).is_dir();
+                        let subject = if is_dir {
+                            format!("folder `{path}/` (all tracked files inside it)")
+                        } else {
+                            format!("`{path}`")
+                        };
+                        self.dialog = Some(Dialog::confirm(
+                            "Stop tracking in git?",
+                            format!(
+                                "Added `{pattern}` to .gitignore, but {subject} is still tracked by git.\n\n\
+                                 Remove it from git's index while keeping your local file(s) on disk?"
+                            ),
+                            "Stop tracking",
                             ops(&[&["rm", "-r", "--cached", "--quiet", "--", &path]]),
-                            Refresh::Status,
-                            plain,
-                            ctx,
-                        );
+                            None,
+                        ));
                     } else {
                         let msg = if added {
                             format!("Added {pattern} to .gitignore")
@@ -2143,7 +2623,7 @@ impl RepoTab {
                         ..
                     })
                 ) {
-                    self.diff = None;
+                    self.clear_diff(ctx);
                 }
             }
             Action::SearchCode(on) => {
@@ -2638,7 +3118,7 @@ pub(crate) fn reveal_label() -> &'static str {
 }
 
 /// Runs the user's editor command with `path` (through `cmd` on Windows, where editors are
-/// usually `.cmd` scripts).
+/// usually `.cmd` scripts) and reaps the child in a background thread.
 pub(crate) fn open_in_editor(editor: &str, path: &Path) -> Result<(), String> {
     let editor = if editor.trim().is_empty() {
         "code"
@@ -2647,7 +3127,7 @@ pub(crate) fn open_in_editor(editor: &str, path: &Path) -> Result<(), String> {
     };
     let mut cmd = if cfg!(windows) {
         let mut c = std::process::Command::new("cmd");
-        c.arg("/C").arg(editor).arg(path);
+        c.args(["/D", "/C", editor]).arg(path);
         c
     } else {
         let mut c = std::process::Command::new(editor);
@@ -2655,14 +3135,62 @@ pub(crate) fn open_in_editor(editor: &str, path: &Path) -> Result<(), String> {
         crate::shell_path::apply(&mut c);
         c
     };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Could not run {editor}: {e}"))
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Could not run {editor}: {e}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn credential_scope(url: &str) -> String {
+    let u = url.trim();
+    if u.is_empty() {
+        return String::new();
+    }
+    if let Some((scheme, rest)) = u.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") {
+            return String::new();
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        if !host.is_empty() {
+            return format!(
+                "{}://{}",
+                scheme.to_ascii_lowercase(),
+                host.to_ascii_lowercase()
+            );
+        }
+        return String::new();
+    }
+    let bytes = u.as_bytes();
+    if !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        && let Some((left, _)) = u.split_once(':')
+    {
+        let host = left.rsplit_once('@').map_or(left, |(_, h)| h);
+        if !host.is_empty() {
+            return host.to_ascii_lowercase();
+        }
+    }
+    String::new()
+}
+
+fn credential_key(url: &str) -> String {
+    let scope = credential_scope(url);
+    if scope.is_empty() {
+        "__default__".to_owned()
+    } else {
+        scope
+    }
 }
 
 fn short_duration(d: Duration) -> String {

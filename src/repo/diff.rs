@@ -14,7 +14,7 @@ use egui::{
 
 use super::highlight::{self, Spans};
 use super::widgets;
-use super::{Action, DiffKey, Refresh, RepoTab, ops, short};
+use super::{Action, DiffKey, Refresh, RepoTab, short};
 use crate::git::{self, Area, DiffOptions};
 use crate::icons;
 use crate::settings::Settings;
@@ -58,6 +58,10 @@ pub struct DiffData {
     pub changed: Vec<Option<(usize, usize)>>,
     /// Side-by-side rows: (left line, right line).
     pub split: Vec<(Option<usize>, Option<usize>)>,
+    /// Longest displayed line length in characters.
+    pub longest: usize,
+    unified_runs: ChangeRuns,
+    split_runs: ChangeRuns,
     pub image: Option<ImagePair>,
     /// The patch's file header (`diff --git`, `index`, `---`, `+++`), for partial patches.
     pub header: String,
@@ -107,6 +111,19 @@ pub struct ImagePair {
     pub id: String,
 }
 
+impl ImagePair {
+    pub(super) fn uris(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.old.is_some() {
+            out.push(format!("bytes://diff/{}/old.png", self.id));
+        }
+        if self.new.is_some() {
+            out.push(format!("bytes://diff/{}/new.png", self.id));
+        }
+        out
+    }
+}
+
 /// Reads and prepares the diff for `key`.
 pub fn load(repo: &Path, key: &DiffKey, opts: DiffOptions, dark: bool) -> Result<DiffData, String> {
     let (text, path) = match key {
@@ -145,38 +162,67 @@ pub fn load(repo: &Path, key: &DiffKey, opts: DiffOptions, dark: bool) -> Result
     // Colour the old and the new side each as one stream, so multi-line constructs work.
     let mut spans = vec![None; lines.len()];
     let old_side: Vec<usize> = (0..lines.len())
-        .filter(|&i| matches!(lines[i].kind, Kind::Context | Kind::Del))
+        .filter(|&i| {
+            lines
+                .get(i)
+                .is_some_and(|l| matches!(l.kind, Kind::Context | Kind::Del))
+        })
         .collect();
     let new_side: Vec<usize> = (0..lines.len())
-        .filter(|&i| matches!(lines[i].kind, Kind::Context | Kind::Add))
+        .filter(|&i| {
+            lines
+                .get(i)
+                .is_some_and(|l| matches!(l.kind, Kind::Context | Kind::Add))
+        })
         .collect();
     if let Some(old) = highlight::highlight(
         &path,
-        old_side.iter().map(|&i| lines[i].text.as_str()),
+        old_side
+            .iter()
+            .map(|&i| lines.get(i).map_or("", |l| l.text.as_str())),
         dark,
     ) {
         for (k, &i) in old_side.iter().enumerate() {
-            if lines[i].kind == Kind::Del {
-                spans[i] = old.get(k).cloned();
+            if lines.get(i).is_some_and(|l| l.kind == Kind::Del)
+                && let Some(slot) = spans.get_mut(i)
+            {
+                *slot = old.get(k).cloned();
             }
         }
     }
     if let Some(new) = highlight::highlight(
         &path,
-        new_side.iter().map(|&i| lines[i].text.as_str()),
+        new_side
+            .iter()
+            .map(|&i| lines.get(i).map_or("", |l| l.text.as_str())),
         dark,
     ) {
         for (k, &i) in new_side.iter().enumerate() {
-            spans[i] = new.get(k).cloned();
+            if let Some(slot) = spans.get_mut(i) {
+                *slot = new.get(k).cloned();
+            }
         }
     }
 
     let (changed, split) = pair_lines(&lines);
+    let longest = lines.iter().map(|l| l.text.chars().count()).max().unwrap_or(0);
+    let unified_runs = change_runs(
+        lines
+            .iter()
+            .map(|l| (l.kind == Kind::Del, l.kind == Kind::Add)),
+    );
+    let split_runs = change_runs(split.iter().map(|&(l, r)| {
+        let kind = |i: Option<usize>| i.and_then(|i| lines.get(i)).map(|x| x.kind);
+        (kind(l) == Some(Kind::Del), kind(r) == Some(Kind::Add))
+    }));
     Ok(DiffData {
         lines,
         spans,
         changed,
         split,
+        longest,
+        unified_runs,
+        split_runs,
         image,
         header,
         partial,
@@ -230,14 +276,14 @@ fn pair_lines(lines: &[DiffLine]) -> (Vec<Option<(usize, usize)>>, Split) {
     let mut split = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        match lines[i].kind {
-            Kind::Del | Kind::Add => {
+        match lines.get(i).map(|l| l.kind) {
+            Some(Kind::Del | Kind::Add) => {
                 let dels_start = i;
-                while i < lines.len() && lines[i].kind == Kind::Del {
+                while i < lines.len() && lines.get(i).is_some_and(|l| l.kind == Kind::Del) {
                     i += 1;
                 }
                 let adds_start = i;
-                while i < lines.len() && lines[i].kind == Kind::Add {
+                while i < lines.len() && lines.get(i).is_some_and(|l| l.kind == Kind::Add) {
                     i += 1;
                 }
                 let dels: Vec<usize> = (dels_start..adds_start).collect();
@@ -245,10 +291,15 @@ fn pair_lines(lines: &[DiffLine]) -> (Vec<Option<(usize, usize)>>, Split) {
                 for k in 0..dels.len().max(adds.len()) {
                     let (d, a) = (dels.get(k).copied(), adds.get(k).copied());
                     if let (Some(d), Some(a)) = (d, a)
-                        && let Some((dr, ar)) = changed_ranges(&lines[d].text, &lines[a].text)
+                        && let (Some(dl), Some(al)) = (lines.get(d), lines.get(a))
+                        && let Some((dr, ar)) = changed_ranges(&dl.text, &al.text)
                     {
-                        changed[d] = Some(dr);
-                        changed[a] = Some(ar);
+                        if let Some(slot) = changed.get_mut(d) {
+                            *slot = Some(dr);
+                        }
+                        if let Some(slot) = changed.get_mut(a) {
+                            *slot = Some(ar);
+                        }
                     }
                     split.push((d, a));
                 }
@@ -391,17 +442,18 @@ fn patch_header(text: &str) -> String {
 
 /// The lines of the hunk whose header is at `h`: up to the next hunk.
 fn hunk_body(lines: &[DiffLine], h: usize) -> std::ops::Range<usize> {
-    let end = lines[h + 1..]
-        .iter()
-        .position(|l| l.kind == Kind::Hunk)
-        .map_or(lines.len(), |n| h + 1 + n);
-    h + 1..end
+    let start = (h + 1).min(lines.len());
+    let end = lines
+        .get(start..)
+        .and_then(|rest| rest.iter().position(|l| l.kind == Kind::Hunk))
+        .map_or(lines.len(), |n| start + n);
+    start..end
 }
 
 /// The added and removed lines of the hunk whose header is at `h`.
 pub fn hunk_changes(lines: &[DiffLine], h: usize) -> BTreeSet<usize> {
     hunk_body(lines, h)
-        .filter(|&i| matches!(lines[i].kind, Kind::Add | Kind::Del))
+        .filter(|&i| lines.get(i).is_some_and(|l| matches!(l.kind, Kind::Add | Kind::Del)))
         .collect()
 }
 
@@ -427,7 +479,9 @@ impl HunkOut {
     /// Writes line `i` as the patch needs it (or not at all), and the "\ No newline at end of
     /// file" note right after it if it has one.
     fn line(&mut self, lines: &[DiffLine], i: usize, picked: bool, reverse: bool) {
-        let line = &lines[i];
+        let Some(line) = lines.get(i) else {
+            return;
+        };
         let as_context = match line.kind {
             Kind::Context => true,
             Kind::Add | Kind::Del if picked => false,
@@ -474,23 +528,26 @@ pub fn partial_patch(
     // How far the hunks written so far moved the other side's line numbers.
     let mut shift: i64 = 0;
     let mut any = false;
-    for h in (0..lines.len()).filter(|&i| lines[i].kind == Kind::Hunk) {
-        let (old_start, new_start, tail) = hunk_numbers(&lines[h].raw)?;
+    for h in (0..lines.len()).filter(|&i| lines.get(i).is_some_and(|l| l.kind == Kind::Hunk)) {
+        let header_line = lines.get(h)?;
+        let (old_start, new_start, tail) = hunk_numbers(&header_line.raw)?;
         let mut out = HunkOut::default();
         let body = hunk_body(lines, h);
         let mut i = body.start;
         while i < body.end {
-            match lines[i].kind {
-                Kind::Del | Kind::Add => {
+            match lines.get(i).map(|l| l.kind) {
+                Some(Kind::Del | Kind::Add) => {
                     // A run of removals and the additions after it, written in pairs (like the
                     // side-by-side view pairs them): replacing the 2nd line of three keeps its
                     // place even when the others are left out.
                     let mut run = |kind: Kind| {
                         let mut found = Vec::new();
                         while i < body.end
-                            && matches!(lines[i].kind, k if k == kind || k == Kind::Meta)
+                            && lines
+                                .get(i)
+                                .is_some_and(|l| l.kind == kind || l.kind == Kind::Meta)
                         {
-                            if lines[i].kind == kind {
+                            if lines.get(i).is_some_and(|l| l.kind == kind) {
                                 found.push(i);
                             }
                             i += 1;
@@ -505,7 +562,7 @@ pub fn partial_patch(
                         }
                     }
                 }
-                Kind::Context => {
+                Some(Kind::Context) => {
                     out.line(lines, i, false, reverse);
                     i += 1;
                 }
@@ -523,12 +580,29 @@ pub fn partial_patch(
             continue;
         }
         any = true;
-        // `git apply` places a hunk by the side it checks: the old one, the new one in reverse.
+        // `git apply` places a hunk by the side it checks: the old one, the new one in reverse,
+        // keeping `0` start for empty (`count == 0`) sides and `>= 1` for non-empty ones.
         let (old_start, new_start) = (i64::from(old_start), i64::from(new_start));
         let (o, n) = if reverse {
-            (new_start - shift, new_start)
+            let n = if new_n == 0 { 0 } else { new_start };
+            let o = if old_n == 0 {
+                0
+            } else if n == 0 {
+                (new_start - shift + 1).max(1)
+            } else {
+                (n - shift).max(1)
+            };
+            (o, n)
         } else {
-            (old_start, old_start + shift)
+            let o = if old_n == 0 { 0 } else { old_start };
+            let n = if new_n == 0 {
+                0
+            } else if o == 0 {
+                (old_start + shift + 1).max(1)
+            } else {
+                (o + shift).max(1)
+            };
+            (o, n)
         };
         shift += new_n - old_n;
         patch.push_str(&format!(
@@ -543,9 +617,11 @@ pub fn partial_patch(
 
 /// `@@ -12,5 +14,7 @@` → (11, 13): the numbers before the first line of the hunk.
 fn hunk_start(header: &str) -> (u32, u32) {
+    let rest = header.trim_start_matches('@').trim_start();
+    let ranges = rest.split_once(" @").map_or(rest, |(r, _)| r);
     let mut old = 0;
     let mut new = 0;
-    for part in header.split_whitespace() {
+    for part in ranges.split_whitespace() {
         let num = |s: &str| {
             s.split(',')
                 .next()
@@ -564,6 +640,11 @@ fn hunk_start(header: &str) -> (u32, u32) {
 
 impl RepoTab {
     pub(super) fn diff_view(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
+        if let Some(view) = &mut self.diff {
+            for uri in view.stale_uris.drain(..) {
+                ui.ctx().forget_image(&uri);
+            }
+        }
         let t = Tokens::get(ui.ctx());
         let Some(view) = &self.diff else { return };
         let idle = self.busy_op.is_none();
@@ -621,19 +702,28 @@ impl RepoTab {
                             acts.push(Action::CloseDiff);
                         }
                         if let DiffKey::Work(file) = &view.key {
-                            let (label, args): (&str, Vec<&str>) = match file.area {
-                                Area::Staged => {
-                                    ("Unstage file", unstage_args(&self.refs.head, &file.path))
-                                }
-                                Area::Conflicted => {
-                                    ("Mark resolved", vec!["add", "--", &file.path])
-                                }
-                                _ => ("Stage file", vec!["add", "--", &file.path]),
+                            let (label, args): (&str, Vec<String>) = match file.area {
+                                Area::Staged => (
+                                    "Unstage file",
+                                    unstage_args(
+                                        &self.refs.head,
+                                        &file.path,
+                                        file.old_path.as_deref(),
+                                    ),
+                                ),
+                                Area::Conflicted => (
+                                    "Mark resolved",
+                                    vec!["add".into(), "--".into(), file.path.clone()],
+                                ),
+                                _ => (
+                                    "Stage file",
+                                    vec!["add".into(), "--".into(), file.path.clone()],
+                                ),
                             };
                             if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
                                 acts.push(Action::Ops {
                                     label: label.to_owned(),
-                                    ops: ops(&[&args]),
+                                    ops: vec![args],
                                     refresh: Refresh::Status,
                                 });
                             }
@@ -769,12 +859,7 @@ impl RepoTab {
             .layout_no_wrap("M".to_owned(), font.clone(), t.text)
             .size()
             .x;
-        let longest = data
-            .lines
-            .iter()
-            .map(|l| l.text.chars().count())
-            .max()
-            .unwrap_or(0) as f32;
+        let longest = data.longest as f32;
 
         ui.spacing_mut().item_spacing.y = 0.0;
         let rows = if split {
@@ -793,6 +878,9 @@ impl RepoTab {
         let mut clicked: Option<usize> = None;
         // Text selection by dragging: where the press and the pointer are in the lines drawn.
         let text_sel = view.text_sel;
+        let pre_selected = text_sel
+            .map(|s| s.text(&data.lines))
+            .filter(|s| !s.is_empty());
         let (press, pointer) = ui.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos()));
         let mut press_hit: Option<(usize, Side, usize)> = None;
         // Each with whether the pointer is over that line's half, not only at its height.
@@ -825,6 +913,21 @@ impl RepoTab {
                 if resp.clicked() {
                     clicked = Some(i);
                 }
+                let line_text = data.lines.get(i).map(|l| l.text.as_str());
+                let pre = pre_selected.as_deref();
+                egui::Popup::context_menu(&resp)
+                    .style(crate::theme::menu_style)
+                    .show(|ui| {
+                        if let Some(sel) = pre {
+                            if ui.button("Copy").clicked() {
+                                ui.ctx().copy_text(sel.to_owned());
+                            }
+                        } else if let Some(text) = line_text
+                            && ui.button("Copy line").clicked()
+                        {
+                            ui.ctx().copy_text(text.to_owned());
+                        }
+                    });
             }
             if kind == Some(Kind::Hunk) && !hunk_picks.is_empty() {
                 // At the visible right end, however wide the line is.
@@ -844,16 +947,9 @@ impl RepoTab {
         // Every change of the file in a strip beside the scrollbar, to see where to scroll to
         // (above all when the whole file is shown). Clicking or dragging it scrolls there.
         let runs = if split {
-            change_runs(data.split.iter().map(|&(l, r)| {
-                let kind = |i: Option<usize>| i.and_then(|i| data.lines.get(i)).map(|x| x.kind);
-                (kind(l) == Some(Kind::Del), kind(r) == Some(Kind::Add))
-            }))
+            &data.split_runs
         } else {
-            change_runs(
-                data.lines
-                    .iter()
-                    .map(|l| (l.kind == Kind::Del, l.kind == Kind::Add)),
-            )
+            &data.unified_runs
         };
         let area = ui.available_rect_before_wrap();
         let strip = Rect::from_min_max(pos2(area.right() - MAP_W, area.top()), area.max);
@@ -862,20 +958,21 @@ impl RepoTab {
         let map = ui
             .interact(
                 strip,
-                ui.id().with(("diff_map", &path)),
+                ui.id().with(("diff_map", &view.key)),
                 Sense::click_and_drag(),
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         // Under the lines, so dragging over them selects text (a click still picks a line).
         let text_drag = ui.interact(
             body,
-            ui.id().with(("diff_text", &path)),
+            ui.id().with(("diff_text", &view.key)),
             Sense::click_and_drag(),
         );
         let mut scroll = egui::ScrollArea::both()
-            .id_salt(("diff_scroll", &path, split))
+            .id_salt(("diff_scroll", &view.key, split))
             .auto_shrink(false);
         if (map.clicked() || map.dragged())
+            && strip.height() > 0.0
             && let Some(p) = map.interact_pointer_pos()
         {
             let at = ((p.y - strip.top()) / strip.height()).clamp(0.0, 1.0) * total_h;
@@ -1024,9 +1121,11 @@ impl super::DiffView {
         match self.anchor {
             Some(a) if extend => {
                 let (lo, hi) = (a.min(i), a.max(i));
-                self.chosen.extend(
-                    (lo..=hi).filter(|&k| matches!(data.lines[k].kind, Kind::Add | Kind::Del)),
-                );
+                self.chosen.extend((lo..=hi).filter(|&k| {
+                    data.lines
+                        .get(k)
+                        .is_some_and(|l| matches!(l.kind, Kind::Add | Kind::Del))
+                }));
             }
             _ => {
                 if !self.chosen.remove(&i) {
@@ -1196,7 +1295,7 @@ fn change_map(
     let p = ui.painter_at(strip);
     p.rect_filled(strip, 0.0, t.chrome);
     let (offset, visible, total) = view;
-    if total <= 0.0 {
+    if total <= 0.0 || strip.height() <= 0.0 {
         return;
     }
     let y = |px: f32| strip.top() + px / total * strip.height();
@@ -1376,7 +1475,9 @@ fn line_job(
             None => vec![start, end],
         };
         for w in cuts.windows(2) {
-            let (from, to) = (w[0], w[1]);
+            let (Some(&from), Some(&to)) = (w.first(), w.get(1)) else {
+                continue;
+            };
             if to <= from {
                 continue;
             }
@@ -1444,12 +1545,28 @@ fn image_view(ui: &mut Ui, images: &ImagePair) {
 }
 
 /// `git restore --staged`, or `git rm --cached` before the first commit (no HEAD to restore from).
-pub(super) fn unstage_args<'a>(head: &str, path: &'a str) -> Vec<&'a str> {
-    if head.is_empty() {
-        vec!["rm", "--cached", "-q", "--", path]
+pub(super) fn unstage_args(head: &str, path: &str, old_path: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = if head.is_empty() {
+        vec![
+            "rm".into(),
+            "--cached".into(),
+            "--ignore-unmatch".into(),
+            "-q".into(),
+            "--".into(),
+            path.to_owned(),
+        ]
     } else {
-        vec!["restore", "--staged", "--", path]
+        vec![
+            "restore".into(),
+            "--staged".into(),
+            "--".into(),
+            path.to_owned(),
+        ]
+    };
+    if let Some(old) = old_path {
+        args.push(old.to_owned());
     }
+    args
 }
 
 #[cfg(test)]
@@ -1709,5 +1826,54 @@ mod tests {
             .collect();
         assert_eq!(pieces, vec!["let x = ", "2", ";"]);
         assert_eq!(job.sections[1].format.background, Color32::GREEN);
+    }
+
+    #[test]
+    fn hunk_start_handles_rust_arrows_and_partial_patch_empty_file() {
+        assert_eq!(
+            hunk_start("@@ -10,4 +12,5 @@ fn foo() -> Result<i32, ()> {"),
+            (9, 11)
+        );
+        let header = "--- /dev/null\n+++ b/new.txt\n";
+        let add_lines = vec![
+            DiffLine {
+                kind: Kind::Hunk,
+                old: None,
+                new: None,
+                text: "@@ -0,0 +1,1 @@".to_owned(),
+                raw: "@@ -0,0 +1,1 @@".to_owned(),
+            },
+            DiffLine {
+                kind: Kind::Add,
+                old: None,
+                new: Some(1),
+                text: "first".to_owned(),
+                raw: "+first".to_owned(),
+            },
+        ];
+        let chosen = BTreeSet::from([1]);
+        let fwd = partial_patch(header, &add_lines, &chosen, Pick::Stage).unwrap_or_default();
+        assert!(fwd.contains("@@ -0,0 +1,1 @@"), "{fwd}");
+
+        let del_header = "--- a/old.txt\n+++ /dev/null\n";
+        let del_lines = vec![
+            DiffLine {
+                kind: Kind::Hunk,
+                old: None,
+                new: None,
+                text: "@@ -1,1 +0,0 @@".to_owned(),
+                raw: "@@ -1,1 +0,0 @@".to_owned(),
+            },
+            DiffLine {
+                kind: Kind::Del,
+                old: Some(1),
+                new: None,
+                text: "gone".to_owned(),
+                raw: "-gone".to_owned(),
+            },
+        ];
+        let rev =
+            partial_patch(del_header, &del_lines, &chosen, Pick::Unstage).unwrap_or_default();
+        assert!(rev.contains("@@ -1,1 +0,0 @@"), "{rev}");
     }
 }

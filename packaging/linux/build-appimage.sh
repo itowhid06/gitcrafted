@@ -5,7 +5,9 @@
 set -eu
 
 out="$1"
-app="$(mktemp -d)/gitcrafted.AppDir"
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+app="$stage/gitcrafted.AppDir"
 mkdir -p "$app/usr/bin" "$app/usr/share/applications" "$app/usr/share/icons"
 
 cp target/release/gitcrafted "$app/usr/bin/gitcrafted"
@@ -24,4 +26,6 @@ exec "$here/usr/bin/gitcrafted" "$@"
 EOF
 chmod +x "$app/AppRun"
 
-ARCH=x86_64 appimagetool "$app" "$out"
+ARCH="${ARCH:-$(uname -m)}"
+export ARCH
+appimagetool "$app" "$out"

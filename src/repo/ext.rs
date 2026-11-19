@@ -99,8 +99,7 @@ impl RepoTab {
                 }
             }
             ExtAction::SaveIssueRules(rules) => {
-                self.save_issue_rules(&rules);
-                self.forget_issue_rules(ctx);
+                self.save_issue_rules(rules, ctx);
                 self.status = Some(("Issue links saved".to_owned(), false));
             }
         }
@@ -198,7 +197,7 @@ impl RepoTab {
     pub(super) fn tools_menu(&self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let idle = self.busy_op.is_none();
         if ui.button("Reflog…").clicked() {
-            acts.push(Action::Dialog(self.reflog_dialog()));
+            acts.push(Action::Dialog(self.reflog_dialog(ui.ctx())));
         }
         if self.bisecting(ui.ctx()) {
             if ui
@@ -213,35 +212,44 @@ impl RepoTab {
         {
             acts.push(Action::Dialog(self.bisect_dialog(None, None)));
         }
-        if super::lfs::available() && ui.button("Git LFS…").clicked() {
-            acts.push(Action::Dialog(self.lfs_dialog()));
+        if super::lfs::available_async(ui.ctx()) && ui.button("Git LFS…").clicked() {
+            acts.push(Action::Dialog(self.lfs_dialog(ui.ctx())));
         }
         ui.separator();
         if ui.button("Maintenance…").clicked() {
-            acts.push(Action::Dialog(self.maintenance_dialog()));
+            acts.push(Action::Dialog(self.maintenance_dialog(ui.ctx())));
         }
         if ui.button("Clean untracked files…").clicked() {
-            acts.push(Action::Dialog(self.clean_dialog()));
+            acts.push(Action::Dialog(self.clean_dialog(ui.ctx())));
         }
         ui.separator();
         ui.menu_button("Open repository in", |ui| {
-            let apps = super::external::detected();
-            if apps.is_empty() {
-                ui.label("No editor found on the PATH");
-            }
-            for app in apps {
-                if ui.button(&app.label).clicked() {
-                    acts.push(Action::Ext(ExtAction::Spawn {
-                        program: app.program.clone(),
-                        args: vec![self.path.display().to_string()],
-                        dir: None,
-                    }));
-                    ui.close();
+            match super::external::detected_async(ui.ctx()) {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Scanning editors…");
+                    });
+                }
+                Some(apps) if apps.is_empty() => {
+                    ui.label("No editor found on the PATH");
+                }
+                Some(apps) => {
+                    for app in apps {
+                        if ui.button(&app.label).clicked() {
+                            acts.push(Action::Ext(ExtAction::Spawn {
+                                program: app.program.clone(),
+                                args: vec![self.path.display().to_string()],
+                                dir: None,
+                            }));
+                            ui.close();
+                        }
+                    }
                 }
             }
         });
         if ui.button("External diff and merge tools…").clicked() {
-            acts.push(Action::Dialog(self.external_tools_dialog()));
+            acts.push(Action::Dialog(self.external_tools_dialog(ui.ctx())));
         }
         if ui.button("Issue links…").clicked() {
             acts.push(Action::Dialog(self.issue_dialog(ui.ctx())));
@@ -282,6 +290,10 @@ pub(super) fn spawn_detached(
     args: &[String],
     dir: Option<&std::path::Path>,
 ) -> Result<(), String> {
+    let program = program.trim();
+    if program.is_empty() {
+        return Err("No program specified".to_owned());
+    }
     let mut cmd = if program == "git" {
         git::git_cmd()
     } else {
@@ -293,8 +305,10 @@ pub(super) fn spawn_detached(
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
-    // A tool that reads the terminal would hang on nothing.
-    cmd.stdin(std::process::Stdio::null());
+    // Detached GUI/helper tools must never inherit pipes or a terminal stream.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

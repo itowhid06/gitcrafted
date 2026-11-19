@@ -1,19 +1,49 @@
 //! Git LFS: install, track and untrack patterns, fetch, pull, push, prune, lock and unlock.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{OnceLock, mpsc};
 
 use egui::{RichText, Ui};
 
-use super::dialogs::{Outcome, title};
+use super::dialogs::{Outcome, title, valid_ref_name};
 use super::ext::{DialogBody, dialog};
 use super::{Action, Dialog, Refresh, RepoTab, ops};
 use crate::git;
 use crate::theme::Tokens;
 
-/// Whether `git lfs` is installed (looked at once).
+static AVAILABLE: OnceLock<bool> = OnceLock::new();
+static PROBE_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether `git lfs` is installed (looked at once, synchronously for tests).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| git::run(None, &["lfs", "version"]).is_ok())
+}
+
+/// Non-blocking check for `git lfs` availability (probes once in the background).
+pub(super) fn available_async(ctx: &egui::Context) -> bool {
+    if let Some(&ok) = AVAILABLE.get() {
+        return ok;
+    }
+    match PROBE_STATE.load(Ordering::Acquire) {
+        2 => true,
+        3 | 1 => false,
+        _ => {
+            if PROBE_STATE
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let wake = ctx.clone();
+                std::thread::spawn(move || {
+                    let ok = git::run(None, &["lfs", "version"]).is_ok();
+                    let _ = AVAILABLE.set(ok);
+                    PROBE_STATE.store(if ok { 2 } else { 3 }, Ordering::Release);
+                    wake.request_repaint();
+                });
+            }
+            false
+        }
+    }
 }
 
 /// The patterns `git lfs track` lists, from its output:
@@ -50,18 +80,29 @@ struct LfsDialog {
     new_pattern: String,
     lock_path: String,
     remote: String,
+    loading: bool,
+    error: Option<String>,
+    rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
 }
 
 impl RepoTab {
-    pub(super) fn lfs_dialog(&self) -> Dialog {
-        let patterns = git::run(Some(&self.path), &["lfs", "track"])
-            .map(|o| parse_tracked(&o))
-            .unwrap_or_default();
+    pub(super) fn lfs_dialog(&self, ctx: &egui::Context) -> Dialog {
+        let (tx, rx) = mpsc::channel();
+        let repo = self.path.clone();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let res = git::run(Some(&repo), &["lfs", "track"]).map(|o| parse_tracked(&o));
+            let _ = tx.send(res);
+            wake.request_repaint();
+        });
         dialog(LfsDialog {
-            patterns,
+            patterns: Vec::new(),
             new_pattern: String::new(),
             lock_path: String::new(),
             remote: self.default_remote().unwrap_or_else(|| "origin".to_owned()),
+            loading: true,
+            error: None,
+            rx: Some(rx),
         })
     }
 }
@@ -76,6 +117,26 @@ fn run(label: &str, args: &[&str]) -> Outcome {
 
 impl DialogBody for LfsDialog {
     fn ui(&mut self, ui: &mut Ui, t: &Tokens, _enter: bool) -> Outcome {
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.loading = false;
+                    self.rx = None;
+                    match res {
+                        Ok(patterns) => {
+                            self.patterns = patterns;
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.loading = false;
+                    self.rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         title(
             ui,
             "Git LFS",
@@ -84,33 +145,51 @@ impl DialogBody for LfsDialog {
         );
         let mut outcome = Outcome::Open;
         ui.label(RichText::new("Tracked patterns").color(t.text_dim));
-        if self.patterns.is_empty() {
-            ui.label(RichText::new("None yet").color(t.text_faint));
-        }
-        for p in &self.patterns {
+        if self.loading {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(p).font(crate::theme::mono(12.0)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Untrack").clicked() {
-                        outcome = run(&format!("Untrack {p}"), &["lfs", "untrack", "--", p]);
+                ui.spinner();
+                ui.label(RichText::new("Loading tracked patterns…").color(t.text_faint));
+            });
+        } else if let Some(e) = &self.error {
+            ui.colored_label(t.danger, e);
+        } else if self.patterns.is_empty() {
+            ui.label(RichText::new("None yet").color(t.text_faint));
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for p in &self.patterns {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(p).font(crate::theme::mono(12.0)));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Untrack").clicked() {
+                                        outcome =
+                                            run(&format!("Untrack {p}"), &["lfs", "untrack", "--", p]);
+                                    }
+                                },
+                            );
+                        });
                     }
                 });
-            });
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.new_pattern)
                     .hint_text("*.psd or assets/**")
-                    .desired_width(ui.available_width() - 70.0)
+                    .desired_width((ui.available_width() - 70.0).max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
             );
-            let can = !self.new_pattern.trim().is_empty();
+            let p = self.new_pattern.trim();
+            let can = !p.is_empty();
             if (ui.add_enabled(can, egui::Button::new("Track")).clicked()
                 || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can))
                 && can
             {
-                let p = self.new_pattern.trim().to_owned();
+                let p = p.to_owned();
                 outcome = run(&format!("Track {p}"), &["lfs", "track", "--", &p]);
             }
         });
@@ -138,8 +217,12 @@ impl DialogBody for LfsDialog {
             {
                 outcome = run("LFS pull", &["lfs", "pull"]);
             }
+            let can_push = valid_ref_name(&self.remote);
             if ui
-                .button(format!("Push to {}", self.remote))
+                .add_enabled(
+                    can_push,
+                    egui::Button::new(format!("Push to {}", self.remote)),
+                )
                 .on_hover_text("Upload every local LFS object (git lfs push --all)")
                 .clicked()
             {
@@ -159,11 +242,11 @@ impl DialogBody for LfsDialog {
             ui.add(
                 egui::TextEdit::singleline(&mut self.lock_path)
                     .hint_text("path/to/file.psd")
-                    .desired_width(ui.available_width() - 130.0)
+                    .desired_width((ui.available_width() - 130.0).max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
             );
-            let can = !self.lock_path.trim().is_empty();
             let path = self.lock_path.trim().to_owned();
+            let can = !path.is_empty();
             if ui.add_enabled(can, egui::Button::new("Lock")).clicked() {
                 outcome = run(&format!("Lock {path}"), &["lfs", "lock", "--", &path]);
             }
@@ -172,7 +255,7 @@ impl DialogBody for LfsDialog {
             }
         });
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button("Install in this repository")
                 .on_hover_text("Sets up the LFS filters and hooks here (git lfs install --local)")
@@ -264,7 +347,7 @@ mod flow_tests {
         let dir = repo("lfs-dialog");
         git(&dir, &["lfs", "track", "*.psd", "assets/**"]);
         let f = Fixture::open(&dir);
-        assert!(matches!(f.tab.lfs_dialog(), Dialog::Ext(_)));
+        assert!(matches!(f.tab.lfs_dialog(&f.ctx), Dialog::Ext(_)));
         assert_eq!(tracked(&dir), ["*.psd", "assets/**"]);
 
         // No LFS server here: lock and push fail with a message, they don't crash.

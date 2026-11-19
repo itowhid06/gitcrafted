@@ -13,6 +13,94 @@ use egui::{Rect, Vec2, load::Bytes};
 
 /// A missing avatar is asked for again after this long.
 const RETRY_MISSING: Duration = Duration::from_secs(7 * 24 * 3600);
+const MAX_AVATAR_BYTES: usize = 512 * 1024;
+const MAX_MEMORY_AVATARS: usize = 512;
+
+fn extract_host(authority: &str) -> Option<&str> {
+    let trimmed = authority.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (addr, after) = rest.split_once(']')?;
+        if after.is_empty() {
+            return Some(addr);
+        }
+        let port = after.strip_prefix(':')?;
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(addr);
+        }
+        return None;
+    }
+    if let Some((host, port)) = trimmed.split_once(':') {
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            Some(host)
+        } else {
+            None
+        }
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn is_safe_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_link_local()
+                || v4.is_private()
+                || v4.is_broadcast()
+                || v4.is_documentation())
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_safe_ip(std::net::IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+            let is_unique_local = (seg0 & 0xfe00) == 0xfc00;
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || is_link_local
+                || is_unique_local)
+        }
+    }
+}
+
+fn is_safe_host(host: &str) -> bool {
+    let Some(bare) = extract_host(host) else {
+        return false;
+    };
+    let lower = bare.to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        return is_safe_ip(ip);
+    }
+    lower != "localhost"
+        && !lower.ends_with(".localhost")
+        && !lower.ends_with(".local")
+        && !lower.starts_with('.')
+        && !lower.ends_with('.')
+        && !lower.starts_with('-')
+        && !lower.ends_with('-')
+        && lower
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+}
+
+fn is_safe_https_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    is_safe_host(host)
+}
 
 #[derive(Clone)]
 enum State {
@@ -46,6 +134,14 @@ fn hints() -> &'static Mutex<HashMap<String, Hint>> {
 /// Records where `email`'s picture is; one already shown from elsewhere is fetched again.
 pub fn hint(email: &str, hint: Hint) {
     let k = email.trim().to_lowercase();
+    if k.is_empty() {
+        return;
+    }
+    match &hint {
+        Hint::Url(u) if !is_safe_https_url(u) => return,
+        Hint::GitLab(h) if !is_safe_host(h) => return,
+        _ => {}
+    }
     let mut h = lock(hints());
     if h.get(&k) == Some(&hint) {
         return;
@@ -58,7 +154,7 @@ pub fn hint(email: &str, hint: Hint) {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    eframe::storage_dir("gitcrafted").map(|d| d.join("avatars"))
+    eframe::storage_dir(crate::APP_ID).map(|d| d.join("avatars"))
 }
 
 fn avatars(ctx: &egui::Context) -> &'static Avatars {
@@ -73,8 +169,16 @@ fn avatars(ctx: &egui::Context) -> &'static Avatars {
             while let Ok(email) = rx.recv() {
                 let hint = lock(hints()).get(&email).cloned();
                 let state = fetch(&agent, &email, hint.as_ref());
-                if let Some(map) = AVATARS.get() {
-                    lock(&map.map).insert(email, state);
+                // Do not overwrite a newer hint that arrived while this fetch was in flight.
+                if lock(hints()).get(&email).cloned() != hint {
+                    continue;
+                }
+                if let Some(av) = AVATARS.get() {
+                    let mut map = lock(&av.map);
+                    if map.len() >= MAX_MEMORY_AVATARS {
+                        map.clear();
+                    }
+                    map.insert(email, state);
                 }
                 ctx.request_repaint();
             }
@@ -101,10 +205,18 @@ fn key(email: &str) -> String {
 fn url(email: &str) -> String {
     let email = email.trim().to_lowercase();
     if let Some(local) = email.strip_suffix("@users.noreply.github.com") {
-        return match local.split_once('+') {
-            Some((id, _)) => format!("https://avatars.githubusercontent.com/u/{id}?s=80"),
-            None => format!("https://github.com/{local}.png?size=80"),
+        let valid_user = |u: &str| {
+            !u.is_empty() && u.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         };
+        match local.split_once('+') {
+            Some((id, _)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+                return format!("https://avatars.githubusercontent.com/u/{id}?s=80");
+            }
+            None if valid_user(local) => {
+                return format!("https://github.com/{local}.png?size=80");
+            }
+            _ => {}
+        }
     }
     format!("https://www.gravatar.com/avatar/{}?s=80&d=404", key(&email))
 }
@@ -121,8 +233,10 @@ fn cache_key(email: &str, hint: Option<&Hint>) -> String {
 /// The picture's URL: a forge's, else [`url`].
 fn source(agent: &ureq::Agent, email: &str, hint: Option<&Hint>) -> String {
     match hint {
-        Some(Hint::Url(u)) => format!("{u}{}s=80", if u.contains('?') { '&' } else { '?' }),
-        Some(Hint::GitLab(host)) => {
+        Some(Hint::Url(u)) if is_safe_https_url(u) => {
+            format!("{u}{}s=80", if u.contains('?') { '&' } else { '?' })
+        }
+        Some(Hint::GitLab(host)) if is_safe_host(host) => {
             let api = format!(
                 "https://{host}/api/v4/avatar?email={}&size=80",
                 query_escape(email)
@@ -136,11 +250,11 @@ fn source(agent: &ureq::Agent, email: &str, hint: Option<&Hint>) -> String {
                 .and_then(|v| v.get("avatar_url")?.as_str().map(str::to_owned));
             match found {
                 // GitLab falls back to a generated Gravatar; initials read better.
-                Some(u) if !u.contains("gravatar.com") => u,
+                Some(u) if is_safe_https_url(&u) && !u.contains("gravatar.com") => u,
                 _ => url(email),
             }
         }
-        None => url(email),
+        _ => url(email),
     }
 }
 
@@ -155,12 +269,28 @@ fn query_escape(s: &str) -> String {
         .collect()
 }
 
+fn is_supported_image(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.len() <= MAX_AVATAR_BYTES && image::guess_format(bytes).is_ok()
+}
+
+fn atomic_write(dir: &std::path::Path, filename: &str, bytes: &[u8]) {
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = dir.join(format!("{filename}.tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, dir.join(filename)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 fn fetch(agent: &ureq::Agent, email: &str, hint: Option<&Hint>) -> State {
     let dir = cache_dir();
     let k = cache_key(email, hint);
     if let Some(dir) = &dir {
-        if let Ok(bytes) = std::fs::read(dir.join(format!("{k}.img"))) {
-            return State::Ready(Arc::from(bytes.into_boxed_slice()), k);
+        let img_path = dir.join(format!("{k}.img"));
+        if let Ok(bytes) = std::fs::read(&img_path) {
+            if is_supported_image(&bytes) {
+                return State::Ready(Arc::from(bytes.into_boxed_slice()), k);
+            }
+            let _ = std::fs::remove_file(&img_path);
         }
         let missing = dir.join(format!("{k}.none"));
         let recent = std::fs::metadata(&missing)
@@ -172,31 +302,34 @@ fn fetch(agent: &ureq::Agent, email: &str, hint: Option<&Hint>) -> State {
             return State::Missing;
         }
     }
-    let result = agent
-        .get(&source(agent, email, hint))
-        .call()
-        .ok()
-        .and_then(|resp| {
-            let mut bytes = Vec::new();
+    let target = source(agent, email, hint);
+    let mut definitively_missing = false;
+    let bytes = match agent.get(&target).call() {
+        Ok(resp) => {
             use std::io::Read;
-            resp.into_reader()
-                .take(512 * 1024)
-                .read_to_end(&mut bytes)
-                .ok()
-                .map(|_| bytes)
-        });
-    match result {
-        Some(bytes) if !bytes.is_empty() => {
+            let mut buf = Vec::new();
+            let _ = resp
+                .into_reader()
+                .take((MAX_AVATAR_BYTES + 1) as u64)
+                .read_to_end(&mut buf);
+            is_supported_image(&buf).then_some(buf)
+        }
+        Err(ureq::Error::Status(404 | 410, _)) => {
+            definitively_missing = true;
+            None
+        }
+        Err(_) => None,
+    };
+    match bytes {
+        Some(bytes) => {
             if let Some(dir) = &dir {
-                let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(dir.join(format!("{k}.img")), &bytes);
+                atomic_write(dir, &format!("{k}.img"), &bytes);
             }
             State::Ready(Arc::from(bytes.into_boxed_slice()), k)
         }
-        _ => {
-            if let Some(dir) = &dir {
-                let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(dir.join(format!("{k}.none")), b"");
+        None => {
+            if definitively_missing && let Some(dir) = &dir {
+                atomic_write(dir, &format!("{k}.none"), b"");
             }
             State::Missing
         }
@@ -206,16 +339,19 @@ fn fetch(agent: &ureq::Agent, email: &str, hint: Option<&Hint>) -> State {
 /// Paints `email`'s avatar into `rect` if it is loaded; returns false (and queues a download)
 /// otherwise, so the caller keeps its initials.
 pub fn paint(ui: &egui::Ui, rect: Rect, email: &str) -> bool {
-    if email.is_empty() || !crate::settings::Settings::get(ui.ctx()).avatars {
+    let k = email.trim().to_lowercase();
+    if k.is_empty() || !crate::settings::Settings::get(ui.ctx()).avatars {
         return false;
     }
     let av = avatars(ui.ctx());
-    let k = email.trim().to_lowercase();
     let state = {
         let mut map = lock(&av.map);
         match map.get(&k) {
             Some(s) => s.clone(),
             None => {
+                if map.len() >= MAX_MEMORY_AVATARS {
+                    map.clear();
+                }
                 map.insert(k.clone(), State::Pending);
                 let _ = lock(&av.queue).send(k.clone());
                 State::Pending
@@ -272,5 +408,27 @@ mod tests {
             url(" MyEmailAddress@example.com "),
             "https://www.gravatar.com/avatar/0bc83cb571cd1c50ba6f3e8a78ef1346?s=80&d=404"
         );
+    }
+
+    #[test]
+    fn rejects_private_loopback_and_non_https_avatar_targets() {
+        for bad in [
+            "localhost",
+            "sub.localhost",
+            "printer.local",
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "[::1]:443",
+            "[::ffff:127.0.0.1]",
+            "fe80::1",
+        ] {
+            assert!(!is_safe_host(bad), "expected {bad} to be rejected");
+        }
+        assert!(is_safe_host("avatars.githubusercontent.com"));
+        assert!(!is_safe_https_url("http://avatars.githubusercontent.com/u/1"));
+        assert!(!is_safe_https_url("https://127.0.0.1/avatar.png"));
+        assert!(!is_safe_https_url("https://avatars.githubusercontent.com/u/1\n"));
+        assert!(is_safe_https_url("https://avatars.githubusercontent.com/u/1?v=4"));
     }
 }

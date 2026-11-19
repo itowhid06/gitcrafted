@@ -54,31 +54,66 @@ fn merge<const N: usize>(paths: [&OsString; N]) -> OsString {
     std::env::join_paths(dirs).unwrap_or_default()
 }
 
+const START_MARK: &str = "__GC_PATH_START__";
+const END_MARK: &str = "__GC_PATH_END__";
+
+fn extract_marked_path(out: &str) -> Option<&str> {
+    let (_, rest) = out.split_once(START_MARK)?;
+    let (path, _) = rest.split_once(END_MARK)?;
+    let path = path.trim();
+    (!path.is_empty()).then_some(path)
+}
+
+fn posix_shell() -> OsString {
+    if let Some(shell) = std::env::var_os("SHELL")
+        && !shell.is_empty()
+    {
+        let p = std::path::Path::new(&shell);
+        if let Some(name) = p.file_name().and_then(|n| n.to_str())
+            && matches!(name, "zsh" | "bash" | "sh" | "ksh" | "dash" | "ash")
+            && p.is_file()
+        {
+            return shell;
+        }
+    }
+    "/bin/zsh".into()
+}
+
 /// `$PATH` as the user's login shell sets it, if it answers within a few seconds.
 fn shell_path() -> Option<OsString> {
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    let shell = posix_shell();
+    let script = format!("printf '{START_MARK}%s{END_MARK}' \"$PATH\"");
     let mut child = Command::new(shell)
-        .args(["-l", "-c", "printf %s \"$PATH\""])
+        .args(["-l", "-c", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let mut s = stdout;
+        let _ = s.read_to_string(&mut out);
+        out
+    });
     let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
-                return None;
+                let _ = child.wait();
+                break None;
             }
         }
+    }?;
+    if !status.success() {
+        return None;
     }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    let out = out.trim();
-    (!out.is_empty()).then(|| out.into())
+    let raw = reader.join().ok()?;
+    extract_marked_path(&raw).map(OsString::from)
 }
 
 #[cfg(test)]

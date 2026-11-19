@@ -130,7 +130,8 @@ impl DialogBody for MergeDialog {
             "Merge but don't commit yet (--no-commit)",
         );
         ui.add_space(8.0);
-        buttons(ui, "Merge", true, enter, || self.action())
+        let valid = super::dialogs::valid_ref_name(&self.branch);
+        buttons(ui, "Merge", valid, enter, || self.action())
     }
 }
 
@@ -267,48 +268,127 @@ impl RepoTab {
 
 // ---- a checkout that local changes block -----------------------------------------------------
 
+#[derive(Clone, Debug)]
+pub(crate) enum CheckoutTarget {
+    Branch(String),
+    Pull(String),
+    Remote { remote_branch: String, local: String },
+}
+
+impl CheckoutTarget {
+    fn display_name(&self) -> &str {
+        match self {
+            CheckoutTarget::Branch(b) | CheckoutTarget::Pull(b) => b,
+            CheckoutTarget::Remote { local, .. } => local,
+        }
+    }
+
+    fn checkout_ops(&self) -> Vec<Vec<String>> {
+        match self {
+            CheckoutTarget::Branch(b) => vec![vec!["checkout".into(), b.clone()]],
+            CheckoutTarget::Pull(b) => vec![
+                vec!["checkout".into(), b.clone()],
+                vec!["pull".into(), "--ff-only".into()],
+            ],
+            CheckoutTarget::Remote { remote_branch, .. } => vec![vec![
+                "checkout".into(),
+                "--track".into(),
+                remote_branch.clone(),
+            ]],
+        }
+    }
+
+    fn force_checkout_ops(&self) -> Vec<Vec<String>> {
+        match self {
+            CheckoutTarget::Branch(b) => vec![vec!["checkout".into(), "--force".into(), b.clone()]],
+            CheckoutTarget::Pull(b) => vec![
+                vec!["checkout".into(), "--force".into(), b.clone()],
+                vec!["pull".into(), "--ff-only".into()],
+            ],
+            CheckoutTarget::Remote { remote_branch, .. } => vec![vec![
+                "checkout".into(),
+                "--force".into(),
+                "--track".into(),
+                remote_branch.clone(),
+            ]],
+        }
+    }
+}
+
 struct BlockedCheckout {
-    target: String,
+    target: CheckoutTarget,
     discard: bool,
 }
 
+fn is_blocked_checkout_error(err: &str) -> bool {
+    err.contains("would be overwritten by checkout")
+        || err.contains("commit your changes or stash them before you switch")
+}
+
 /// The dialog to offer when `label` (a checkout) failed with `err` because of local changes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn blocked_checkout(label: &str, err: &str) -> Option<Dialog> {
-    let target = label.strip_prefix("Checkout ")?.trim();
-    let blocked = err.contains("would be overwritten by checkout")
-        || err.contains("commit your changes or stash them before you switch");
-    (blocked && !target.is_empty()).then(|| {
-        dialog(BlockedCheckout {
-            target: target.to_owned(),
-            discard: false,
-        })
-    })
+    blocked_checkout_for(None, label, err)
+}
+
+/// Like [`blocked_checkout`], preserving structured checkout target info (branch, pull, remote).
+pub(super) fn blocked_checkout_for(
+    target: Option<CheckoutTarget>,
+    label: &str,
+    err: &str,
+) -> Option<Dialog> {
+    if !is_blocked_checkout_error(err) {
+        return None;
+    }
+    let resolved = target.or_else(|| {
+        if let Some(b) = label.strip_prefix("Checkout and pull ").map(str::trim)
+            && !b.is_empty()
+        {
+            return Some(CheckoutTarget::Pull(b.to_owned()));
+        }
+        let b = label.strip_prefix("Checkout ")?.trim();
+        (!b.is_empty()).then(|| CheckoutTarget::Branch(b.to_owned()))
+    })?;
+    Some(dialog(BlockedCheckout {
+        target: resolved,
+        discard: false,
+    }))
 }
 
 /// Stash what is in the way (untracked files too), switch, bring the stash back.
+#[cfg_attr(not(test), allow(dead_code))]
 fn switch_with_changes(target: &str) -> Action {
+    switch_with_target(&CheckoutTarget::Branch(target.to_owned()))
+}
+
+fn switch_with_target(target: &CheckoutTarget) -> Action {
+    let name = target.display_name();
+    let mut ops_list = vec![vec![
+        "stash".into(),
+        "push".into(),
+        "--include-untracked".into(),
+        "-m".into(),
+        format!("gitcrafted: before switching to {name}"),
+    ]];
+    ops_list.extend(target.checkout_ops());
+    ops_list.push(vec!["stash".into(), "pop".into(), "--index".into()]);
     Action::Ops {
-        label: format!("Switch to {target} with your changes"),
-        ops: vec![
-            vec![
-                "stash".into(),
-                "push".into(),
-                "--include-untracked".into(),
-                "-m".into(),
-                format!("gitcrafted: before switching to {target}"),
-            ],
-            vec!["checkout".into(), target.to_owned()],
-            vec!["stash".into(), "pop".into(), "--index".into()],
-        ],
+        label: format!("Switch to {name} with your changes"),
+        ops: ops_list,
         refresh: Refresh::All,
     }
 }
 
 /// Switch and lose the local changes.
+#[cfg_attr(not(test), allow(dead_code))]
 fn discard_and_switch(target: &str) -> Action {
+    discard_and_switch_target(&CheckoutTarget::Branch(target.to_owned()))
+}
+
+fn discard_and_switch_target(target: &CheckoutTarget) -> Action {
     Action::Ops {
-        label: format!("Checkout {target}"),
-        ops: ops(&[&["checkout", "--force", target]]),
+        label: format!("Checkout {}", target.display_name()),
+        ops: target.force_checkout_ops(),
         refresh: Refresh::All,
     }
 }
@@ -318,7 +398,10 @@ impl DialogBody for BlockedCheckout {
         title(
             ui,
             "Local changes are in the way",
-            &format!("Switching to {} would overwrite them.", self.target),
+            &format!(
+                "Switching to {} would overwrite them.",
+                self.target.display_name()
+            ),
             t,
         );
         let mut outcome = Outcome::Open;
@@ -326,7 +409,7 @@ impl DialogBody for BlockedCheckout {
             .on_hover_text("Stashes your changes, checks out, then pops the stash back")
             .clicked()
         {
-            outcome = Outcome::Done(switch_with_changes(&self.target));
+            outcome = Outcome::Done(switch_with_target(&self.target));
         }
         ui.add_space(8.0);
         ui.checkbox(
@@ -336,7 +419,7 @@ impl DialogBody for BlockedCheckout {
             )
             .color(t.danger),
         );
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     self.discard,
@@ -344,7 +427,7 @@ impl DialogBody for BlockedCheckout {
                 )
                 .clicked()
             {
-                outcome = Outcome::Done(discard_and_switch(&self.target));
+                outcome = Outcome::Done(discard_and_switch_target(&self.target));
             }
             if ui.button("Cancel").clicked() {
                 outcome = Outcome::Cancel;
@@ -1135,5 +1218,29 @@ mod review_tests {
         f.tab.reload_status(&f.ctx);
         f.pump_until(|f| f.tab.patch_sel.is_empty());
         assert!(f.tab.patch_sel.is_empty());
+    }
+
+    #[test]
+    fn blocked_checkout_preserves_pull_and_remote_targets() {
+        assert!(blocked_checkout_for(
+            Some(CheckoutTarget::Pull("main".into())),
+            "anything",
+            "would be overwritten by checkout"
+        )
+        .is_some());
+        let pull = CheckoutTarget::Pull("main".into());
+        assert_eq!(pull.checkout_ops(), ops(&[&["checkout", "main"], &["pull", "--ff-only"]]));
+        let rem = CheckoutTarget::Remote {
+            local: "feat".into(),
+            remote_branch: "origin/feat".into(),
+        };
+        assert_eq!(
+            rem.checkout_ops(),
+            ops(&[&["checkout", "--track", "origin/feat"]])
+        );
+        assert_eq!(
+            rem.force_checkout_ops(),
+            ops(&[&["checkout", "--force", "--track", "origin/feat"]])
+        );
     }
 }

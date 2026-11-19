@@ -13,6 +13,7 @@ pub const LOG_PAGE: usize = 1500;
 
 pub(crate) fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
+    cmd.stdin(std::process::Stdio::null());
     // Never block on an interactive prompt: credential helpers with a GUI still work.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
@@ -20,6 +21,15 @@ pub(crate) fn git_cmd() -> Command {
     cmd.env("GIT_EDITOR", "true");
     // Interactive rebases set `sequence.editor` themselves; an inherited one would win.
     cmd.env_remove("GIT_SEQUENCE_EDITOR");
+    // Force English diagnostics without clobbering character classification (`LC_CTYPE`).
+    if std::env::var_os("LC_CTYPE").is_none()
+        && let Some(lc_all) = std::env::var_os("LC_ALL")
+    {
+        cmd.env("LC_CTYPE", lc_all);
+    }
+    cmd.env_remove("LC_ALL");
+    cmd.env("LC_MESSAGES", "C");
+    cmd.env("LANGUAGE", "C");
     crate::shell_path::apply(&mut cmd);
     #[cfg(windows)]
     {
@@ -67,7 +77,7 @@ pub struct Credentials {
 /// A credential helper that answers git's `get` from the environment, so the secret never shows
 /// up in a command line. git tries the user's own helpers first and, when the operation works,
 /// asks them to store what this one gave.
-const ENV_HELPER: &str = "credential.helper=!f() { test \"$1\" = get && echo \"username=$GITCRAFTED_GIT_USERNAME\" && echo \"password=$GITCRAFTED_GIT_PASSWORD\"; }; f";
+const ENV_HELPER: &str = "credential.helper=!f() { test \"$1\" = get && printf 'username=%s\\npassword=%s\\n' \"$GITCRAFTED_GIT_USERNAME\" \"$GITCRAFTED_GIT_PASSWORD\"; }; f";
 
 /// [`run`], answering a credential request with `creds` when given.
 pub fn run_with(
@@ -106,9 +116,10 @@ fn run_inner(
         cmd.arg("-C").arg(dir);
     }
     if let Some(c) = creds {
+        let strip_nl = |s: &str| s.replace(['\r', '\n'], "");
         cmd.args(["-c", ENV_HELPER]);
-        cmd.env("GITCRAFTED_GIT_USERNAME", &c.username);
-        cmd.env("GITCRAFTED_GIT_PASSWORD", &c.password);
+        cmd.env("GITCRAFTED_GIT_USERNAME", strip_nl(&c.username));
+        cmd.env("GITCRAFTED_GIT_PASSWORD", strip_nl(&c.password));
     }
     cmd.args(args);
     let out = cmd
@@ -150,9 +161,14 @@ pub fn version() -> Result<String, String> {
 
 /// The top-level folder of the repository containing `path`.
 pub fn toplevel(path: &Path) -> Result<PathBuf, String> {
-    let out = run(Some(path), &["rev-parse", "--show-toplevel"])
+    let target = if path.is_file() {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    let out = run(Some(target), &["rev-parse", "--show-toplevel"])
         .map_err(|_| format!("{} is not inside a git repository", path.display()))?;
-    Ok(PathBuf::from(out.trim()))
+    Ok(PathBuf::from(out.trim_end_matches(['\r', '\n'])))
 }
 
 pub fn init(path: &Path) -> Result<(), String> {
@@ -205,7 +221,7 @@ pub struct Refs {
 
 pub fn refs(repo: &Path) -> Result<Refs, String> {
     let format = format!(
-        "%(refname){FS}%(refname:short){FS}%(objectname){FS}%(HEAD){FS}%(upstream:short){FS}%(upstream:track){FS}%(*objectname)"
+        "%(refname){FS}%(objectname){FS}%(HEAD){FS}%(upstream){FS}%(upstream:track){FS}%(*objectname)"
     );
     let out = run(
         Some(repo),
@@ -220,39 +236,66 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
     let mut refs = Refs::default();
     for line in out.lines() {
         let f: Vec<&str> = line.split(FS).collect();
-        let [full, short, oid, head, upstream, track, peeled] = f[..] else {
+        let [full, oid, head, upstream_full, track, peeled] = f[..] else {
             continue;
         };
         // Annotated tags point at a tag object; the commit is the peeled id.
         let target = if peeled.is_empty() { oid } else { peeled };
-        let branch = Branch {
-            name: short.to_owned(),
-            target: target.to_owned(),
-            is_head: head == "*",
-            upstream: upstream.to_owned(),
-            track: track.to_owned(),
-        };
-        if full.starts_with("refs/heads/") {
+        let upstream = upstream_full
+            .strip_prefix("refs/remotes/")
+            .or_else(|| upstream_full.strip_prefix("refs/heads/"))
+            .unwrap_or(upstream_full)
+            .to_owned();
+        if let Some(short) = full.strip_prefix("refs/heads/") {
+            let branch = Branch {
+                name: short.to_owned(),
+                target: target.to_owned(),
+                is_head: head == "*",
+                upstream,
+                track: track.to_owned(),
+            };
             if branch.is_head {
                 refs.current = Some(branch.name.clone());
             }
             refs.local.push(branch);
         } else if let Some(rest) = full.strip_prefix("refs/remotes/") {
-            if rest.ends_with("/HEAD") {
+            if rest.ends_with("/HEAD") || !rest.contains('/') {
                 continue;
             }
+            let branch = Branch {
+                name: rest.to_owned(),
+                target: target.to_owned(),
+                is_head: head == "*",
+                upstream,
+                track: track.to_owned(),
+            };
             let remote = rest.split('/').next().unwrap_or_default().to_owned();
             match refs.remotes.iter_mut().find(|(r, _)| *r == remote) {
                 Some((_, list)) => list.push(branch),
                 None => refs.remotes.push((remote, vec![branch])),
             }
-        } else if full.starts_with("refs/tags/") {
+        } else if let Some(short) = full.strip_prefix("refs/tags/") {
+            let branch = Branch {
+                name: short.to_owned(),
+                target: target.to_owned(),
+                is_head: head == "*",
+                upstream,
+                track: track.to_owned(),
+            };
             refs.tags.push(branch);
         }
     }
     refs.head = run(Some(repo), &["rev-parse", "--verify", "-q", "HEAD"])
         .map(|s| s.trim().to_owned())
         .unwrap_or_default();
+    if refs.current.is_none()
+        && let Ok(branch) = run(Some(repo), &["symbolic-ref", "--short", "-q", "HEAD"])
+    {
+        let name = branch.trim();
+        if !name.is_empty() {
+            refs.current = Some(name.to_owned());
+        }
+    }
     Ok(refs)
 }
 
@@ -302,7 +345,7 @@ pub fn log(repo: &Path, skip: usize, limit: usize) -> Result<Vec<Commit>, String
         if record.is_empty() {
             continue;
         }
-        let f: Vec<&str> = record.split(FS).collect();
+        let f: Vec<&str> = record.splitn(9, FS).collect();
         let [
             hash,
             parents,
@@ -376,6 +419,20 @@ pub struct CommitDetail {
     pub merges_after: bool,
 }
 
+fn attach_numstat(files: &mut [ChangedFile], numstat_out: &str) {
+    let mut by_path: std::collections::HashMap<String, (Option<u32>, Option<u32>)> =
+        std::collections::HashMap::new();
+    for (path, added, removed) in parse_numstat(numstat_out) {
+        by_path.insert(path, (added, removed));
+    }
+    for file in files {
+        if let Some(&(added, removed)) = by_path.get(&file.path) {
+            file.added = added;
+            file.removed = removed;
+        }
+    }
+}
+
 pub fn commit_detail(repo: &Path, hash: &str) -> Result<CommitDetail, String> {
     let format = format!("--format=%H{FS}%P{FS}%an{FS}%ae{FS}%ad{FS}%cn{FS}%cd{FS}%B");
     let out = run(
@@ -396,6 +453,8 @@ pub fn commit_detail(repo: &Path, hash: &str) -> Result<CommitDetail, String> {
     // Merges are shown against their first parent, like most GUIs do.
     let diff_args = |kind: &'static str| {
         [
+            "-c",
+            "core.quotePath=false",
             "show",
             "--format=",
             "--diff-merges=first-parent",
@@ -409,12 +468,7 @@ pub fn commit_detail(repo: &Path, hash: &str) -> Result<CommitDetail, String> {
     let numstat_out = run(Some(repo), &diff_args("--numstat"))?;
 
     let mut files = parse_name_status(&status_out);
-    for (path, added, removed) in parse_numstat(&numstat_out) {
-        if let Some(file) = files.iter_mut().find(|f| f.path == path) {
-            file.added = added;
-            file.removed = removed;
-        }
-    }
+    attach_numstat(&mut files, &numstat_out);
 
     let in_head = run(Some(repo), &["merge-base", "--is-ancestor", h, "HEAD"]).is_ok();
     let merges_after = in_head
@@ -516,7 +570,15 @@ impl DiffOptions {
 
 /// The patch of one file in a commit.
 pub fn file_diff(repo: &Path, hash: &str, path: &str, opts: DiffOptions) -> Result<String, String> {
-    let mut args = vec!["show", "--format=", "--diff-merges=first-parent", "-M"];
+    let mut args = vec![
+        "--literal-pathspecs",
+        "-c",
+        "core.quotePath=false",
+        "show",
+        "--format=",
+        "--diff-merges=first-parent",
+        "-M",
+    ];
     opts.push_args(&mut args);
     args.extend([hash, "--", path]);
     run(Some(repo), &args)
@@ -526,18 +588,13 @@ pub fn file_diff(repo: &Path, hash: &str, path: &str, opts: DiffOptions) -> Resu
 /// their line counts.
 pub fn diff_files(repo: &Path, from: &str, to: Option<&str>) -> Result<Vec<ChangedFile>, String> {
     let args = |kind: &'static str| {
-        let mut args = vec!["diff", "-M", kind, "-z", from];
+        let mut args = vec!["-c", "core.quotePath=false", "diff", "-M", kind, "-z", from];
         args.extend(to);
         args.push("--");
         args
     };
     let mut files = parse_name_status(&run(Some(repo), &args("--name-status"))?);
-    for (path, added, removed) in parse_numstat(&run(Some(repo), &args("--numstat"))?) {
-        if let Some(file) = files.iter_mut().find(|f| f.path == path) {
-            file.added = added;
-            file.removed = removed;
-        }
-    }
+    attach_numstat(&mut files, &run(Some(repo), &args("--numstat"))?);
     Ok(files)
 }
 
@@ -549,7 +606,7 @@ pub fn range_file_diff(
     path: &str,
     opts: DiffOptions,
 ) -> Result<String, String> {
-    let mut args = vec!["diff", "-M"];
+    let mut args = vec!["--literal-pathspecs", "-c", "core.quotePath=false", "diff", "-M"];
     opts.push_args(&mut args);
     args.push(from);
     args.extend(to);
@@ -586,10 +643,20 @@ pub fn count_apart(repo: &Path, a: &str, b: &str) -> Result<(u32, u32), String> 
 /// operation is a plain list of git commands, which undo can replay). Patches older than a day
 /// are cleared on the way.
 pub fn save_patch(patch: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join("gitcrafted-patches");
+    let dir = eframe::storage_dir(crate::APP_ID)
+        .map(|d| d.join("patches"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("gitcrafted-patches-{}", std::process::id()))
+        });
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let old = e
@@ -603,14 +670,33 @@ pub fn save_patch(patch: &str) -> Result<PathBuf, String> {
             }
         }
     }
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!("{}-{}-{n}.patch", std::process::id(), now()));
-    std::fs::write(&path, patch).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(path)
+    let pid = std::process::id();
+    let ts = now();
+    for _ in 0..32 {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{pid}-{ts}-{n}.patch"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(mut f) => {
+                f.write_all(patch.as_bytes())
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Err("could not create unique temporary patch file".to_owned())
 }
 
 /// Which side of the index a working-tree file is listed on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Area {
     Staged,
     Unstaged,
@@ -618,7 +704,7 @@ pub enum Area {
     Conflicted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StatusFile {
     pub path: String,
     pub old_path: Option<String>,
@@ -774,19 +860,35 @@ pub fn status(repo: &Path) -> Result<WorkStatus, String> {
             break;
         }
     }
-    if status.in_progress.is_some()
-        && let Ok(path) = run(Some(repo), &["rev-parse", "--git-path", "MERGE_MSG"])
-    {
-        let path = repo.join(path.trim());
-        status.prepared_message = std::fs::read_to_string(path).ok().map(|m| {
-            // Drop git's `#` comment lines.
-            m.lines()
-                .filter(|l| !l.starts_with('#'))
-                .collect::<Vec<_>>()
-                .join("\n")
-                .trim()
-                .to_owned()
-        });
+    if let Some(in_prog) = status.in_progress {
+        let candidates: &[&str] = match in_prog {
+            InProgress::Rebase => &["rebase-merge/message", "rebase-apply/msg", "MERGE_MSG"],
+            _ => &["MERGE_MSG"],
+        };
+        for rel in candidates {
+            let Ok(path) = run(Some(repo), &["rev-parse", "--git-path", rel]) else {
+                continue;
+            };
+            let full = repo.join(path.trim_end_matches(['\r', '\n']));
+            let Ok(meta) = std::fs::metadata(&full) else {
+                continue;
+            };
+            if meta.len() > 256 * 1024 {
+                continue;
+            }
+            if let Ok(m) = std::fs::read_to_string(&full) {
+                status.prepared_message = Some(
+                    // Drop git's `#` comment lines.
+                    m.lines()
+                        .filter(|l| !l.starts_with('#'))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim()
+                        .to_owned(),
+                );
+                break;
+            }
+        }
     }
     Ok(status)
 }
@@ -835,8 +937,8 @@ fn parse_status(out: &str) -> WorkStatus {
 pub fn work_diff(repo: &Path, file: &StatusFile, opts: DiffOptions) -> Result<String, String> {
     let path = file.path.as_str();
     let mut args: Vec<&str> = match file.area {
-        Area::Staged => vec!["diff", "--cached", "-M"],
-        _ => vec!["diff"],
+        Area::Staged => vec!["--literal-pathspecs", "-c", "core.quotePath=false", "diff", "--cached", "-M"],
+        _ => vec!["--literal-pathspecs", "-c", "core.quotePath=false", "diff"],
     };
     opts.push_args(&mut args);
     args.extend(["--", path]);
@@ -845,7 +947,7 @@ pub fn work_diff(repo: &Path, file: &StatusFile, opts: DiffOptions) -> Result<St
         // An untracked file has no history: show it as all added.
         Area::Untracked => run_ok_codes(
             Some(repo),
-            &["diff", "--no-index", "--", "/dev/null", path],
+            &["--literal-pathspecs", "-c", "core.quotePath=false", "diff", "--no-index", "--", "/dev/null", path],
             &[0, 1],
         ),
     }
@@ -940,11 +1042,15 @@ pub fn remotes(repo: &Path) -> Result<Vec<Remote>, String> {
     let out = run(Some(repo), &["remote", "-v"])?;
     let mut list: Vec<Remote> = Vec::new();
     for line in out.lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(name), Some(url)) = (parts.next(), parts.next()) else {
+        let Some((name, rest)) = line.split_once('\t') else {
             continue;
         };
-        if !list.iter().any(|r| r.name == name) {
+        let url = rest
+            .strip_suffix(" (fetch)")
+            .or_else(|| rest.strip_suffix(" (push)"))
+            .unwrap_or(rest)
+            .trim_end();
+        if !name.is_empty() && !list.iter().any(|r| r.name == name) {
             list.push(Remote {
                 name: name.to_owned(),
                 url: url.to_owned(),
@@ -957,6 +1063,7 @@ pub fn remotes(repo: &Path) -> Result<Vec<Remote>, String> {
 /// Commits whose message or author matches `query` (case-insensitive), or whose hash starts
 /// with it, newest first.
 pub fn search(repo: &Path, query: &str) -> Result<Vec<String>, String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut hashes: Vec<String> = Vec::new();
     let base = [
         "log",
@@ -972,7 +1079,8 @@ pub fn search(repo: &Path, query: &str) -> Result<Vec<String>, String> {
         args.push(&filter);
         if let Ok(out) = run(Some(repo), &args) {
             for h in out.lines() {
-                if !hashes.iter().any(|x| x == h) {
+                let h = h.trim();
+                if !h.is_empty() && seen.insert(h.to_owned()) {
                     hashes.push(h.to_owned());
                 }
             }
@@ -980,13 +1088,20 @@ pub fn search(repo: &Path, query: &str) -> Result<Vec<String>, String> {
     }
     let q = query.trim();
     if q.len() >= 4
+        && !q.starts_with('-')
         && q.chars().all(|c| c.is_ascii_hexdigit())
         && let Ok(h) = run(
             Some(repo),
             &["rev-parse", "--verify", "-q", &format!("{q}^{{commit}}")],
         )
     {
-        hashes.insert(0, h.trim().to_owned());
+        let h = h.trim().to_owned();
+        if !h.is_empty() {
+            if !seen.insert(h.clone()) {
+                hashes.retain(|x| x != &h);
+            }
+            hashes.insert(0, h);
+        }
     }
     Ok(hashes)
 }
@@ -994,7 +1109,7 @@ pub fn search(repo: &Path, query: &str) -> Result<Vec<String>, String> {
 /// Commits that added or removed `query` in a file's contents (`git log -S`), newest first.
 pub fn search_code(repo: &Path, query: &str) -> Result<Vec<String>, String> {
     let pickaxe = format!("-S{query}");
-    let out = run(
+    let out = match run(
         Some(repo),
         &[
             "log",
@@ -1004,8 +1119,20 @@ pub fn search_code(repo: &Path, query: &str) -> Result<Vec<String>, String> {
             "--format=%H",
             &pickaxe,
         ],
-    )?;
-    Ok(out.lines().map(str::to_owned).collect())
+    ) {
+        Ok(out) => out,
+        Err(e) if e.contains("does not have any commits") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut hashes = Vec::new();
+    for line in out.lines() {
+        let h = line.trim();
+        if !h.is_empty() && seen.insert(h.to_owned()) {
+            hashes.push(h.to_owned());
+        }
+    }
+    Ok(hashes)
 }
 
 /// The name and email commits are made with here, and whether they're set for this repository
@@ -1105,7 +1232,11 @@ fn gitignore_with(existing: &str, pattern: &str) -> Option<String> {
 
 /// Whether git tracks `path` (so ignoring it also needs `git rm --cached`).
 pub fn is_tracked(repo: &Path, path: &str) -> bool {
-    run(Some(repo), &["ls-files", "--error-unmatch", "--", path]).is_ok()
+    run(
+        Some(repo),
+        &["--literal-pathspecs", "ls-files", "--error-unmatch", "--", path],
+    )
+    .is_ok()
 }
 
 /// One commit in a file's history, with the file's path at that commit (renames are followed).
@@ -1124,6 +1255,7 @@ pub struct FileCommit {
 pub fn file_history(repo: &Path, rev: Option<&str>, path: &str) -> Result<Vec<FileCommit>, String> {
     let format = format!("--format={RS}%H{FS}%an{FS}%ae{FS}%at{FS}%s");
     let mut args = vec![
+        "--literal-pathspecs",
         "-c",
         "core.quotePath=false",
         "log",
@@ -1178,7 +1310,13 @@ impl BlameLine {
 
 /// `git blame` of `path`, as of `rev` (the working tree when `None`).
 pub fn blame(repo: &Path, rev: Option<&str>, path: &str) -> Result<Vec<BlameLine>, String> {
-    let mut args = vec!["blame", "--porcelain"];
+    let mut args = vec![
+        "--literal-pathspecs",
+        "-c",
+        "core.quotePath=false",
+        "blame",
+        "--porcelain",
+    ];
     if let Some(rev) = rev {
         args.push(rev);
     }
@@ -1203,7 +1341,9 @@ fn parse_blame(out: &str) -> Vec<BlameLine> {
         }
         let Some(c) = current.as_mut() else {
             let hash = line.split(' ').next().unwrap_or_default();
-            if hash.len() == 40 {
+            if (hash.len() == 40 || hash.len() == 64)
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
                 current = Some(known.get(hash).cloned().unwrap_or_else(|| BlameLine {
                     hash: hash.to_owned(),
                     ..BlameLine::default()
@@ -1225,7 +1365,7 @@ fn parse_blame(out: &str) -> Vec<BlameLine> {
 
 /// "3 minutes ago", "2 days ago"… for `time` seen from `now` (both Unix seconds).
 pub fn relative_time(time: i64, now: i64) -> String {
-    let secs = (now - time).max(0);
+    let secs = (i128::from(now) - i128::from(time)).max(0);
     let (n, unit) = match secs {
         0..60 => return "just now".to_owned(),
         60..3_600 => (secs / 60, "minute"),
@@ -1424,5 +1564,54 @@ second.
         assert_eq!(names, ["stash@{0}", "stash@{1}"]);
         assert_eq!(list[0].message, "c");
         assert!(list.iter().all(|s| s.base == head.trim()));
+    }
+
+    #[test]
+    fn log_handles_unit_separator_in_body_and_remotes_with_spaces() {
+        let dir = std::env::temp_dir().join(format!("gitcrafted-git-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(run(Some(&dir), &["init", "-q"]).is_ok());
+        assert!(run(Some(&dir), &["config", "user.name", "t"]).is_ok());
+        assert!(run(Some(&dir), &["config", "user.email", "t@t"]).is_ok());
+        let file = dir.join("nested").join("f.txt");
+        let _ = std::fs::create_dir_all(dir.join("nested"));
+        let _ = std::fs::write(&file, "x\n");
+        assert!(run(Some(&dir), &["add", "."]).is_ok());
+        assert!(
+            run(
+                Some(&dir),
+                &["commit", "-q", "-m", "subject", "-m", "body\u{1f}with\u{1f}fs"]
+            )
+            .is_ok()
+        );
+        assert!(run(Some(&dir), &["remote", "add", "origin", "/tmp/path with spaces/repo.git"]).is_ok());
+
+        let commits = log(&dir, 0, 10).unwrap_or_default();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].summary, "subject");
+        let rem = remotes(&dir).unwrap_or_default();
+        assert_eq!(rem.len(), 1);
+        assert_eq!(rem[0].url, "/tmp/path with spaces/repo.git");
+        let top = toplevel(&file).unwrap_or_default();
+        assert_eq!(
+            std::fs::canonicalize(&top).ok(),
+            std::fs::canonicalize(&dir).ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_blame_supports_sha256_and_relative_time_handles_extremes() {
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let porcelain = format!(
+            "{sha256} 1 1 1\nauthor Alice\nauthor-mail <a@b.c>\nauthor-time 1700000000\nsummary hi\n\tlet x = 1;\n"
+        );
+        let lines = parse_blame(&porcelain);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hash, sha256);
+        assert_eq!(lines[0].text, "let x = 1;");
+        let _ = relative_time(i64::MIN, i64::MAX);
+        let _ = relative_time(i64::MAX, i64::MIN);
     }
 }

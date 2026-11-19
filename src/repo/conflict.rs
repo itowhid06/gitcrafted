@@ -41,6 +41,17 @@ pub struct ConflictEditor {
     rebase: bool,
 }
 
+fn is_marker(bare: &str, ch: char) -> bool {
+    let prefix = [ch; 7];
+    let mut chars = bare.chars();
+    for &p in &prefix {
+        if chars.next() != Some(p) {
+            return false;
+        }
+    }
+    matches!(chars.next(), None | Some(' ' | '\t'))
+}
+
 /// Splits a file with conflict markers into common text and conflicts (diff3 bases kept).
 fn parse(text: &str) -> (Vec<Segment>, String, String) {
     enum State {
@@ -53,32 +64,34 @@ fn parse(text: &str) -> (Vec<Segment>, String, String) {
     let (mut common, mut ours, mut base, mut theirs) =
         (String::new(), String::new(), None::<String>, String::new());
     let (mut ours_label, mut theirs_label) = (String::new(), String::new());
+    let mut current_ours_line = String::new();
     let mut state = State::Common;
     for line in text.split_inclusive('\n') {
         let bare = line.trim_end_matches(['\r', '\n']);
         match state {
-            State::Common if bare.starts_with("<<<<<<<") => {
+            State::Common if is_marker(bare, '<') => {
                 if !common.is_empty() {
                     segments.push(Segment::Common(std::mem::take(&mut common)));
                 }
+                current_ours_line = line.to_owned();
                 if ours_label.is_empty() {
                     ours_label = bare.trim_start_matches('<').trim().to_owned();
                 }
                 state = State::Ours;
             }
             State::Common => common.push_str(line),
-            State::Ours if bare.starts_with("|||||||") => {
+            State::Ours if is_marker(bare, '|') => {
                 base = Some(String::new());
                 state = State::Base;
             }
-            State::Ours | State::Base if bare.starts_with("=======") => state = State::Theirs,
+            State::Ours | State::Base if bare == "=======" => state = State::Theirs,
             State::Ours => ours.push_str(line),
             State::Base => {
                 if let Some(b) = &mut base {
                     b.push_str(line);
                 }
             }
-            State::Theirs if bare.starts_with(">>>>>>>") => {
+            State::Theirs if is_marker(bare, '>') => {
                 if theirs_label.is_empty() {
                     theirs_label = bare.trim_start_matches('>').trim().to_owned();
                 }
@@ -87,13 +100,32 @@ fn parse(text: &str) -> (Vec<Segment>, String, String) {
                     base: base.take(),
                     theirs: std::mem::take(&mut theirs),
                 });
+                current_ours_line.clear();
                 state = State::Common;
             }
             State::Theirs => theirs.push_str(line),
         }
     }
-    if !common.is_empty() {
-        segments.push(Segment::Common(common));
+    // Preserve any trailing unclosed conflict block rather than silently dropping file contents.
+    match state {
+        State::Common => {
+            if !common.is_empty() {
+                segments.push(Segment::Common(common));
+            }
+        }
+        State::Ours | State::Base | State::Theirs => {
+            let mut raw = current_ours_line;
+            raw.push_str(&ours);
+            if let Some(b) = base {
+                raw.push_str("||||||| base\n");
+                raw.push_str(&b);
+            }
+            if matches!(state, State::Theirs) {
+                raw.push_str("=======\n");
+                raw.push_str(&theirs);
+            }
+            segments.push(Segment::Common(raw));
+        }
     }
     (segments, ours_label, theirs_label)
 }
@@ -136,10 +168,17 @@ fn render(segments: &[Segment], choices: &[Option<Choice>], labels: (&str, &str)
     out
 }
 
+const MAX_CONFLICT_BYTES: u64 = 10 * 1024 * 1024;
+
 impl ConflictEditor {
-    /// Opens `path` if it still has conflict markers.
+    /// Opens `path` if it still has conflict markers and fits within [`MAX_CONFLICT_BYTES`].
     pub fn open(repo: &Path, path: &str, state: Option<InProgress>) -> Option<Self> {
-        let text = std::fs::read_to_string(repo.join(path)).ok()?;
+        let full = repo.join(path);
+        let meta = std::fs::metadata(&full).ok()?;
+        if meta.len() > MAX_CONFLICT_BYTES {
+            return None;
+        }
+        let text = std::fs::read_to_string(full).ok()?;
         let (segments, ours_label, theirs_label) = parse(&text);
         let conflicts = segments
             .iter()
@@ -177,10 +216,21 @@ impl ConflictEditor {
     }
 
     fn unresolved(&self) -> usize {
-        self.result
-            .lines()
-            .filter(|l| l.starts_with("<<<<<<<"))
-            .count()
+        let mut starts = 0usize;
+        let mut orphans = 0usize;
+        for l in self.result.lines() {
+            let bare = l.trim_end_matches('\r');
+            if is_marker(bare, '<') {
+                starts += 1;
+            } else if bare == "=======" || is_marker(bare, '>') || is_marker(bare, '|') {
+                orphans += 1;
+            }
+        }
+        if starts > 0 {
+            starts
+        } else {
+            usize::from(orphans > 0)
+        }
     }
 
     pub fn save(&self, repo: &Path) -> Result<(), String> {
@@ -412,7 +462,7 @@ impl RepoTab {
                                             };
                                             // No wrapping: wrapped code loses its indentation.
                                             egui::ScrollArea::horizontal()
-                                                .id_salt(("conflict-side", name, body.len()))
+                                                .id_salt(("conflict-side", k, name))
                                                 .show(ui, |ui| {
                                                     ui.add(
                                                         egui::Label::new(
@@ -484,6 +534,31 @@ mod tests {
         assert_eq!(
             render(&segs, &[Some(Choice::Ours)], (&o, &t)),
             "a\r\nmine\r\nz\r\n"
+        );
+    }
+
+    #[test]
+    fn unclosed_conflict_at_eof_preserves_lines_and_counts_orphan_markers() {
+        let truncated = "top\n<<<<<<< HEAD\nours\n=======\ntheirs without closing\n";
+        let (segs, _, _) = parse(truncated);
+        let out = render(&segs, &[], ("HEAD", "theirs"));
+        assert_eq!(out, truncated);
+        let ed = ConflictEditor {
+            path: "f.txt".into(),
+            choices: Vec::new(),
+            segments: Vec::new(),
+            result: "ok\n=======\n>>>>>>> b\n".into(),
+            manual: true,
+            ours_label: "HEAD".into(),
+            theirs_label: "b".into(),
+            rebase: false,
+        };
+        assert_eq!(ed.unresolved(), 1);
+        let padded_sep = "<<<<<<< HEAD\na\n========\nb\n>>>>>>> b\n";
+        let (segs2, _, _) = parse(padded_sep);
+        assert!(
+            segs2.iter().all(|s| !matches!(s, Segment::Conflict { .. })),
+            "non-exact separator must not split conflict block"
         );
     }
 }

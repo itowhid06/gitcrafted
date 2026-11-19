@@ -353,7 +353,7 @@ impl RepoTab {
             return;
         }
         for sub in shown {
-            self.submodule_row(ui, acts, idle, sub);
+            ui.push_id(&sub.path, |ui| self.submodule_row(ui, acts, idle, sub));
         }
     }
 
@@ -599,7 +599,10 @@ fn submodule_menu_items(
         });
     }
     if ui
-        .add_enabled(abs.is_dir(), egui::Button::new(super::reveal_label()))
+        .add_enabled(
+            abs.is_dir() && !sub.path.is_empty() && !sub.path.starts_with('-'),
+            egui::Button::new(super::reveal_label()),
+        )
         .clicked()
     {
         let _ = open::that_detached(abs);

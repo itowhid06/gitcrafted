@@ -31,13 +31,10 @@ pub fn latest() -> Result<Release, String> {
 }
 
 fn release_from_url(url: &str) -> Option<Release> {
-    let tag = url
-        .split_once("/releases/tag/")?
-        .1
-        .split(['?', '#'])
-        .next()?;
+    let prefix = "https://github.com/itowhid06/gitcrafted/releases/tag/";
+    let tag = url.strip_prefix(prefix)?.split(['?', '#']).next()?;
     (!tag.is_empty()).then(|| Release {
-        version: tag.trim_start_matches('v').to_owned(),
+        version: tag.trim_start_matches(['v', 'V']).to_owned(),
         url: url.to_owned(),
     })
 }
@@ -45,7 +42,7 @@ fn release_from_url(url: &str) -> Option<Release> {
 /// Whether version `a` comes after `b` (`1.10.0` > `1.9.2`; pre-release suffixes are ignored).
 pub fn newer(a: &str, b: &str) -> bool {
     let parts = |v: &str| -> Vec<u64> {
-        v.trim_start_matches('v')
+        v.trim_start_matches(['v', 'V'])
             .split(['-', '+'])
             .next()
             .unwrap_or_default()

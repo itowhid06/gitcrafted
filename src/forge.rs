@@ -30,16 +30,16 @@ impl Forge {
     }
 }
 
-/// The forge hosting `origin` (or the first remote), from its URL.
+/// The forge hosting `origin` (or the first remote), from its hostname.
 pub fn detect(remotes: &[Remote]) -> Option<Forge> {
     let remote = remotes
         .iter()
         .find(|r| r.name == "origin")
         .or_else(|| remotes.first())?;
-    let url = remote.url.to_lowercase();
-    if url.contains("github.com") || url.contains("github.") {
+    let (host, _) = location(&remote.url)?;
+    if host == "github.com" || host.ends_with(".github.com") || host.starts_with("github.") {
         Some(Forge::GitHub)
-    } else if url.contains("gitlab") {
+    } else if host == "gitlab.com" || host.ends_with(".gitlab.com") || host.starts_with("gitlab.") {
         Some(Forge::GitLab)
     } else {
         None
@@ -58,26 +58,74 @@ pub struct PullRequest {
 }
 
 fn tool(forge: Forge, repo: &Path, args: &[&str]) -> Result<String, String> {
+    use std::io::{ErrorKind, Read};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
     let mut cmd = Command::new(forge.tool());
-    cmd.current_dir(repo).args(args);
-    cmd.env("GH_PROMPT_DISABLED", "1").env("NO_PROMPT", "1");
+    cmd.current_dir(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_PROMPT", "1");
     crate::shell_path::apply(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
-    let out = cmd.output().map_err(|_| {
-        format!(
-            "{} isn't installed: gitcrafted uses it for {}s",
-            forge.tool(),
-            forge.noun()
-        )
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == ErrorKind::NotFound {
+            format!(
+                "{} isn't installed: gitcrafted uses it for {}s",
+                forge.tool(),
+                forge.noun()
+            )
+        } else {
+            format!("could not start {}: {e}", forge.tool())
+        }
     })?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("{} timed out after 20s", forge.tool()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("{} failed: {e}", forge.tool()));
+            }
+        }
+    }?;
+    let stdout_bytes = out_reader.join().unwrap_or_default();
+    let stderr_bytes = err_reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+        Err(String::from_utf8_lossy(&stderr_bytes).trim().to_owned())
     }
 }
 
@@ -176,30 +224,72 @@ pub fn create(
     tool(forge, repo, &args).map(|out| out.trim().to_owned())
 }
 
+/// Strips userinfo and optional `:port` from an authority component, keeping IPv6 brackets.
+fn authority_host(authority: &str) -> &str {
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, r)| r);
+    if host_port.starts_with('[') {
+        return host_port
+            .find(']')
+            .and_then(|end| host_port.get(..=end))
+            .unwrap_or(host_port);
+    }
+    host_port.split(':').next().unwrap_or(host_port)
+}
+
 /// The web host and `owner/repo` path of a remote URL: `https://host/owner/repo.git`,
 /// `git@host:owner/repo.git` or `ssh://git@host[:port]/owner/repo`.
 pub fn location(url: &str) -> Option<(String, String)> {
     let url = url.trim();
+    if url.is_empty() || url.starts_with('/') || url.chars().any(char::is_whitespace) {
+        return None;
+    }
     let (host, path) = match url.split_once("://") {
-        Some((_, rest)) => {
-            let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
-            let (host, path) = rest.split_once('/')?;
-            (host.split(':').next().unwrap_or(host), path)
+        Some((scheme, rest)) => {
+            if scheme.eq_ignore_ascii_case("file") {
+                return None;
+            }
+            let (authority, path) = rest.split_once('/')?;
+            (authority_host(authority), path)
         }
         None => {
-            let rest = url.rsplit_once('@').map_or(url, |(_, r)| r);
-            rest.split_once(':')?
+            // Reject Windows drive paths like `C:/repos/bare.git` or `C:\...`.
+            let bytes = url.as_bytes();
+            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                return None;
+            }
+            let (left, path) = url.split_once(':')?;
+            let host = authority_host(left);
+            (host, path)
         }
     };
     let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
-    (!host.is_empty() && path.contains('/')).then(|| (host.to_lowercase(), path.to_owned()))
+    let safe_host = !host.is_empty()
+        && !host.starts_with('-')
+        && !host.contains(['?', '#', '\\']);
+    let safe_path = path.contains('/')
+        && !path.starts_with('-')
+        && !path.contains("..")
+        && !path.contains(['?', '#', '\\']);
+    (safe_host && safe_path).then(|| (host.to_lowercase(), path.to_owned()))
 }
 
 /// GitHub accounts' avatars by commit email, from the repository's latest commits (the API ties
 /// each commit to the account its email belongs to). Through `gh` when it's installed (private
 /// repositories, higher limits), else GitHub's public API.
 pub fn github_avatars(repo: &Path, host: &str, path: &str) -> HashMap<String, String> {
+    if host.is_empty()
+        || host.starts_with('-')
+        || host.contains(['/', '?', '#', '\\'])
+        || host.chars().any(char::is_whitespace)
+        || path.is_empty()
+        || path.starts_with('-')
+        || path.contains("..")
+        || path.contains(['?', '#', '\\'])
+        || path.chars().any(char::is_whitespace)
+    {
+        return HashMap::new();
+    }
     let endpoint = format!("repos/{path}/commits?per_page=100");
     let mut args = vec!["api", endpoint.as_str()];
     if host != "github.com" {
@@ -297,6 +387,24 @@ mod tests {
             Some(Forge::GitLab)
         );
         assert_eq!(detect(&[r("origin", "C:/repos/bare.git")]), None);
+        assert_eq!(
+            detect(&[r("origin", "https://evil.example/github.com/repo.git")]),
+            None,
+            "path match alone must not misdetect forge host"
+        );
+    }
+
+    #[test]
+    fn location_rejects_local_drives_ipv6_and_unsafe_paths() {
+        assert_eq!(location("C:\\repos\\foo.git"), None);
+        assert_eq!(location("D:/repos/foo"), None);
+        assert_eq!(location("file:///srv/git/repo.git"), None);
+        assert_eq!(location("https://github.com/../../etc/passwd"), None);
+        assert_eq!(location("-oProxyCommand=bad:owner/repo"), None);
+        assert_eq!(
+            location("ssh://git@[::1]:2222/owner/repo.git"),
+            Some(("[::1]".to_owned(), "owner/repo".to_owned()))
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! without any, GitHub and GitLab remotes link `#123` to their issues.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Response, RichText, Sense, Ui};
@@ -101,6 +101,10 @@ pub fn find_links(text: &str, rules: &[Rule]) -> Vec<Link> {
     let after_ok = |j: usize| chars.get(j).is_none_or(|c| !alnum(*c));
     let mut found: Vec<Link> = Vec::new();
     for rule in rules {
+        let prefix: Option<Vec<char>> = match &rule.kind {
+            Kind::Prefix(p) if !p.is_empty() => Some(p.chars().collect()),
+            _ => None,
+        };
         let mut i = 0;
         while i < chars.len() {
             // (end, id) of a match starting at i.
@@ -128,14 +132,17 @@ pub fn find_links(text: &str, rules: &[Rule]) -> Vec<Link> {
                         None
                     }
                 }
-                Kind::Prefix(p) if !p.is_empty() => {
-                    let prefix: Vec<char> = p.chars().collect();
-                    let start_ok = !alnum(prefix[0]) || before_ok(i);
-                    if start_ok && chars[i..].starts_with(&prefix) {
-                        let from = i + prefix.len();
-                        let end = digits_end(&chars, from);
-                        (end > from && after_ok(end))
-                            .then(|| (end, chars[from..end].iter().collect()))
+                Kind::Prefix(_) => {
+                    if let Some(prefix) = &prefix {
+                        let start_ok = !alnum(prefix[0]) || before_ok(i);
+                        if start_ok && chars[i..].starts_with(prefix) {
+                            let from = i + prefix.len();
+                            let end = digits_end(&chars, from);
+                            (end > from && after_ok(end))
+                                .then(|| (end, chars[from..end].iter().collect()))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -219,47 +226,71 @@ pub fn write_rules(repo: &std::path::Path, rules: &[Rule]) {
     }
 }
 
+/// Whether `url` is safe to pass to `open::that_detached`: `http://` or `https://` with a
+/// non-empty host and no whitespace or control characters.
+pub(crate) fn is_safe_web_url(url: &str) -> bool {
+    let u = url.trim();
+    if u.is_empty() || u.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some(rest) = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    !host.is_empty()
+}
+
 impl RepoTab {
     fn issue_cache_id(&self) -> egui::Id {
         egui::Id::new(("gitcrafted-issue-rules", &self.path))
     }
 
-    /// The tab's issue rules (read from git config once, then remembered).
+    /// The tab's issue rules (cached from background reloads; never blocks UI thread).
     pub(super) fn issue_rules(&self, ctx: &egui::Context) -> Arc<Vec<Rule>> {
         let id = self.issue_cache_id();
         if let Some(rules) = ctx.data(|d| d.get_temp::<Arc<Vec<Rule>>>(id)) {
             return rules;
         }
-        let rules = self.stored_issue_rules();
-        let rules = Arc::new(if rules.is_empty() {
+        let rules = Arc::new(if self.stored_issue_rules.is_empty() {
             self.default_remote()
                 .and_then(|r| self.remotes.iter().find(|x| x.name == r))
                 .map(|r| default_rules(&r.url))
                 .unwrap_or_default()
         } else {
-            rules
+            self.stored_issue_rules.clone()
         });
         ctx.data_mut(|d| d.insert_temp(id, rules.clone()));
         rules
     }
 
-    fn stored_issue_rules(&self) -> Vec<Rule> {
-        read_rules(&self.path)
+    pub(super) fn save_issue_rules(&mut self, rules: Vec<Rule>, ctx: &egui::Context) {
+        self.stored_issue_rules = rules.clone();
+        self.forget_issue_rules(ctx);
+        let repo = self.path.clone();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            write_rules(&repo, &rules);
+            wake.request_repaint();
+        });
     }
 
-    pub(super) fn save_issue_rules(&self, rules: &[Rule]) {
-        write_rules(&self.path, rules);
-    }
-
-    /// Forget the remembered rules (after saving them).
+    /// Forget the remembered rules (after saving them or reloading).
     pub(super) fn forget_issue_rules(&self, ctx: &egui::Context) {
         let id = self.issue_cache_id();
         ctx.data_mut(|d| d.remove::<Arc<Vec<Rule>>>(id));
     }
 
-    pub(super) fn issue_dialog(&self, _ctx: &egui::Context) -> Dialog {
+    pub(super) fn issue_dialog(&self, ctx: &egui::Context) -> Dialog {
+        let (tx, rx) = mpsc::channel();
+        let repo = self.path.clone();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_rules(&repo));
+            wake.request_repaint();
+        });
         dialog(IssueDialog {
-            rules: self.stored_issue_rules(),
+            rules: self.stored_issue_rules.clone(),
             kind: 0,
             prefix: String::new(),
             url: String::new(),
@@ -268,20 +299,54 @@ impl RepoTab {
                 .and_then(|r| self.remotes.iter().find(|x| x.name == r))
                 .map(|r| default_rules(&r.url))
                 .unwrap_or_default(),
+            edited: false,
+            rx: Some(rx),
         })
     }
 }
 
+fn pointer_in_link(
+    galley: &egui::Galley,
+    pos: egui::Pos2,
+    pointer: egui::Pos2,
+    range: &Range<usize>,
+) -> bool {
+    let rel = (pointer - pos).to_pos2();
+    let on_row = galley
+        .rows
+        .iter()
+        .find(|r| r.rect().contains(rel));
+    let Some(hovered_row) = on_row else {
+        return false;
+    };
+    for i in range.clone() {
+        let a = galley.pos_from_cursor(egui::text::CCursor::new(i));
+        let b = galley.pos_from_cursor(egui::text::CCursor::new(i + 1));
+        if (a.min.y - b.min.y).abs() < 1.0 {
+            let char_rect = egui::Rect::from_min_max(a.min, egui::pos2(b.max.x, a.max.y.max(b.max.y)));
+            if char_rect.contains(rel) {
+                return true;
+            }
+        } else if a.y_range().contains(rel.y) {
+            let row_right = hovered_row.rect().right();
+            if rel.x >= a.min.x && rel.x <= row_right {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Text whose `#123`-like parts are links; `sense` is what the whole text reacts to. A click on
-/// a link opens it in the browser. Returns the text's response.
-pub(super) fn linked_text(
+/// a link opens it in the browser. Returns `(response, clicked_link)`.
+pub(super) fn linked_text_hit(
     ui: &mut Ui,
     text: &str,
     font: FontId,
     color: Color32,
     rules: &[Rule],
     sense: Sense,
-) -> Response {
+) -> (Response, bool) {
     let links = find_links(text, rules);
     let link_color = Tokens::get(ui.ctx()).accent;
     let mut job = LayoutJob::default();
@@ -331,26 +396,45 @@ pub(super) fn linked_text(
                 .add(egui::epaint::TextShape::new(pos, galley.clone(), color));
         }
     }
-    if let Some(pointer) = resp.hover_pos() {
-        let index = galley.cursor_from_pos(pointer - pos).index.0;
-        if let Some(link) = links.iter().find(|l| l.range.contains(&index)) {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            if resp.clicked() {
-                open_link(&link.url);
-            }
+    let mut hit_link = false;
+    if let Some(pointer) = resp.hover_pos()
+        && let Some(link) = links
+            .iter()
+            .find(|l| pointer_in_link(&galley, pos, pointer, &l.range))
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        hit_link = true;
+        if resp.clicked() {
+            open_link(&link.url);
         }
     }
-    resp
+    (resp, hit_link)
 }
 
-/// Opens a link in the browser (in tests, remembers it instead).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn linked_text(
+    ui: &mut Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    rules: &[Rule],
+    sense: Sense,
+) -> Response {
+    linked_text_hit(ui, text, font, color, rules, sense).0
+}
+
+/// Opens a link in the browser (in tests, remembers it instead). Only safe `http://` or
+/// `https://` URLs are opened.
 fn open_link(url: &str) {
+    if !is_safe_web_url(url) {
+        return;
+    }
     #[cfg(not(test))]
     {
-        let _ = open::that_detached(url);
+        let _ = open::that_detached(url.trim());
     }
     #[cfg(test)]
-    OPENED.with(|o| o.borrow_mut().push(url.to_owned()));
+    OPENED.with(|o| o.borrow_mut().push(url.trim().to_owned()));
 }
 
 #[cfg(test)]
@@ -365,12 +449,28 @@ struct IssueDialog {
     prefix: String,
     url: String,
     defaults: Vec<Rule>,
+    edited: bool,
+    rx: Option<mpsc::Receiver<Vec<Rule>>>,
 }
 
 const KINDS: [&str; 3] = ["#123", "ABC-123 (Jira style)", "Prefix + number"];
 
 impl DialogBody for IssueDialog {
     fn ui(&mut self, ui: &mut Ui, t: &Tokens, _enter: bool) -> Outcome {
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(rules) => {
+                    self.rx = None;
+                    if !self.edited {
+                        self.rules = rules;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         title(
             ui,
             "Issue links",
@@ -383,20 +483,35 @@ impl DialogBody for IssueDialog {
                 None => "No rules yet".to_owned(),
             };
             ui.label(RichText::new(text).color(t.text_faint));
-        }
-        let mut remove = None;
-        for (i, r) in self.rules.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(r.describe()).font(crate::theme::mono(11.5)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Remove").clicked() {
-                        remove = Some(i);
+        } else {
+            let mut remove = None;
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, r) in self.rules.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(r.describe()).font(crate::theme::mono(11.5)),
+                                )
+                                .truncate(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Remove").clicked() {
+                                        remove = Some(i);
+                                    }
+                                },
+                            );
+                        });
                     }
                 });
-            });
-        }
-        if let Some(i) = remove {
-            self.rules.remove(i);
+            if let Some(i) = remove {
+                self.rules.remove(i);
+                self.edited = true;
+            }
         }
         ui.add_space(6.0);
         ui.separator();
@@ -430,8 +545,16 @@ impl DialogBody for IssueDialog {
                     .margin(egui::Margin::symmetric(8, 4)),
             )
         });
-        let can_add =
-            !self.url.trim().is_empty() && (self.kind != 2 || !self.prefix.trim().is_empty());
+        let url_trimmed = self.url.trim();
+        let url_ok = is_safe_web_url(&url_trimmed.replace("{id}", "1"));
+        if !url_trimmed.is_empty() && !url_ok {
+            ui.label(
+                RichText::new("URL must start with http:// or https:// with no spaces.")
+                    .color(t.danger)
+                    .small(),
+            );
+        }
+        let can_add = url_ok && (self.kind != 2 || !self.prefix.trim().is_empty());
         if ui
             .add_enabled(can_add, egui::Button::new("Add rule"))
             .clicked()
@@ -443,10 +566,11 @@ impl DialogBody for IssueDialog {
             };
             self.rules.push(Rule {
                 kind,
-                url: self.url.trim().to_owned(),
+                url: url_trimmed.to_owned(),
             });
             self.url.clear();
             self.prefix.clear();
+            self.edited = true;
         }
         ui.add_space(8.0);
         buttons(ui, "Save", true, false, || {
@@ -617,10 +741,11 @@ mod flow_tests {
                 .is_some_and(|(m, e)| !e && m.contains("Issue links saved"))
         );
         assert_eq!(*f.tab.issue_rules(&f.ctx), rules());
-        assert_eq!(read_rules(&dir), rules());
+        assert!(wait_for(|| read_rules(&dir) == rules()));
 
         // Another host with no rules of its own: nothing.
         f.tab.ext_action(ExtAction::SaveIssueRules(vec![]), &f.ctx);
+        assert!(wait_for(|| read_rules(&dir).is_empty()));
         f.tab.remotes[0].url = "git@example.org:org/repo.git".to_owned();
         f.tab.forget_issue_rules(&f.ctx);
         assert!(f.tab.issue_rules(&f.ctx).is_empty());
@@ -629,13 +754,13 @@ mod flow_tests {
     #[test]
     fn the_remembered_rules_stay_until_forgotten() {
         let dir = repo("is-cache");
-        let f = Fixture::open(&dir);
         write_rules(&dir, &rules()[..1]);
+        let mut f = Fixture::open(&dir);
         assert_eq!(f.tab.issue_rules(&f.ctx).len(), 1);
-        // Changed behind the tab's back: still the remembered ones, then the new ones.
+        // Changed behind the tab's back: still the remembered ones until reloaded.
         write_rules(&dir, &rules());
         assert_eq!(f.tab.issue_rules(&f.ctx).len(), 1);
-        f.tab.forget_issue_rules(&f.ctx);
+        f.reload();
         assert_eq!(f.tab.issue_rules(&f.ctx).len(), 3);
         assert!(matches!(f.tab.issue_dialog(&f.ctx), Dialog::Ext(_)));
     }
@@ -859,5 +984,15 @@ mod review_tests {
         }
         let opened = OPENED.with(|o| o.borrow().clone());
         assert_eq!(opened, ["https://t/issues/12"]);
+    }
+
+    #[test]
+    fn safe_web_url_rejects_dangerous_schemes_and_control_chars() {
+        assert!(is_safe_web_url("https://github.com/org/repo/issues/1"));
+        assert!(is_safe_web_url("http://tracker.local:8080/browse/ABC-1"));
+        assert!(!is_safe_web_url("file:///etc/passwd"));
+        assert!(!is_safe_web_url("javascript:alert(1)"));
+        assert!(!is_safe_web_url("https://github.com/a b"));
+        assert!(!is_safe_web_url("https://"));
     }
 }

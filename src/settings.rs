@@ -74,20 +74,63 @@ fn id() -> egui::Id {
     egui::Id::new("gitcrafted-settings")
 }
 
+#[derive(Clone, Default)]
+struct DesktopUiCache {
+    checked_at: Option<std::time::Instant>,
+    packaged: bool,
+    target: Option<std::path::PathBuf>,
+    installed: bool,
+    appimage: bool,
+    error: Option<String>,
+}
+
+impl DesktopUiCache {
+    fn refresh(&mut self) {
+        self.checked_at = Some(std::time::Instant::now());
+        self.packaged = crate::desktop_entry::is_packaged();
+        self.target = crate::desktop_entry::target();
+        self.installed = crate::desktop_entry::installed();
+        self.appimage = crate::desktop_entry::is_appimage();
+    }
+}
+
 impl Settings {
     pub fn get(ctx: &egui::Context) -> Settings {
         ctx.data(|d| d.get_temp::<Settings>(id()))
             .unwrap_or_default()
     }
 
+    /// Clamps floating-point fields to valid ranges and replaces any `NaN`/`inf` with defaults.
+    pub fn sanitize(&mut self) {
+        self.ui_scale = if self.ui_scale.is_finite() {
+            self.ui_scale.clamp(0.7, 2.0)
+        } else {
+            1.0
+        };
+        self.terminal_font = if self.terminal_font.is_finite() {
+            self.terminal_font.clamp(9.0, 20.0)
+        } else {
+            12.5
+        };
+        self.refs_width = if self.refs_width.is_finite() {
+            self.refs_width.clamp(150.0, 600.0)
+        } else {
+            270.0
+        };
+    }
+
     pub fn set(&self, ctx: &egui::Context) {
-        ctx.data_mut(|d| d.insert_temp(id(), self.clone()));
-        ctx.set_zoom_factor(self.ui_scale.clamp(0.7, 2.0));
+        let mut clean = self.clone();
+        clean.sanitize();
+        let zoom = clean.ui_scale;
+        ctx.data_mut(|d| d.insert_temp(id(), clean));
+        ctx.set_zoom_factor(zoom);
         crate::vscode_theme::set_enabled(self.vscode_colors);
     }
 
     /// The settings form. Returns true when something changed.
     pub fn ui(&mut self, ui: &mut Ui) -> bool {
+        self.sanitize();
         let t = Tokens::get(ui.ctx());
         let before = self.clone();
         let section = |ui: &mut Ui, title: &str| {
@@ -139,18 +182,31 @@ impl Settings {
             ui.label("Notifications");
             ui.checkbox(&mut self.notifications, "When a long operation ends in the background");
             ui.end_row();
-            if let Some(exe) = crate::desktop_entry::target() {
+            let cache_id = egui::Id::new("gitcrafted-settings-desktop-ui");
+            let mut desk = ui
+                .ctx()
+                .data(|d| d.get_temp::<DesktopUiCache>(cache_id))
+                .unwrap_or_default();
+            if desk
+                .checked_at
+                .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3))
+            {
+                desk.refresh();
+            }
+            if let Some(exe) = desk.target.clone() {
                 ui.label("Applications menu");
                 ui.horizontal(|ui| {
-                    if crate::desktop_entry::installed() {
+                    if desk.installed {
                         if ui.button("Remove gitcrafted").clicked() {
-                            let _ = crate::desktop_entry::uninstall();
+                            desk.error = crate::desktop_entry::uninstall().err();
+                            desk.refresh();
                         }
                     } else if ui.button("Add gitcrafted").clicked() {
-                        let _ = crate::desktop_entry::install(&exe);
+                        desk.error = crate::desktop_entry::install(&exe).err();
+                        desk.refresh();
                     }
                     ui.label(
-                        RichText::new(if crate::desktop_entry::is_appimage() {
+                        RichText::new(if desk.appimage {
                             "Starts this AppImage; follows it when you replace it"
                         } else {
                             "Shows the icon and name in the dock and top bar; follows this program"
@@ -160,7 +216,32 @@ impl Settings {
                     );
                 });
                 ui.end_row();
+                if let Some(err) = &desk.error {
+                    ui.label("");
+                    ui.colored_label(t.danger, err);
+                    ui.end_row();
+                }
+            } else if desk.packaged && desk.installed {
+                ui.label("Applications menu");
+                ui.horizontal(|ui| {
+                    if ui.button("Remove local override").clicked() {
+                        desk.error = crate::desktop_entry::remove_override().err();
+                        desk.refresh();
+                    }
+                    ui.label(
+                        RichText::new("A local desktop file may shadow the packaged install")
+                            .color(t.warning)
+                            .small(),
+                    );
+                });
+                ui.end_row();
+                if let Some(err) = &desk.error {
+                    ui.label("");
+                    ui.colored_label(t.danger, err);
+                    ui.end_row();
+                }
             }
+            ui.ctx().data_mut(|d| d.insert_temp(cache_id, desk));
             ui.label("Updates");
             ui.checkbox(&mut self.check_updates, "Check GitHub for a new version every 12 hours");
             ui.end_row();
@@ -255,5 +336,35 @@ impl Settings {
             self.profiles.push(Profile::default());
         }
         *self != before
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_replaces_non_finite_and_clamps_ranges() {
+        let mut s = Settings {
+            ui_scale: f32::NAN,
+            terminal_font: f32::INFINITY,
+            refs_width: f32::NEG_INFINITY,
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(s.ui_scale, 1.0);
+        assert_eq!(s.terminal_font, 12.5);
+        assert_eq!(s.refs_width, 270.0);
+
+        let mut extreme = Settings {
+            ui_scale: 0.1,
+            terminal_font: 99.0,
+            refs_width: 9000.0,
+            ..Settings::default()
+        };
+        extreme.sanitize();
+        assert_eq!(extreme.ui_scale, 0.7);
+        assert_eq!(extreme.terminal_font, 20.0);
+        assert_eq!(extreme.refs_width, 600.0);
     }
 }

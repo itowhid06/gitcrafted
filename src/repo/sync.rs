@@ -5,7 +5,7 @@
 
 use egui::{Align, Layout, RichText, Ui, vec2};
 
-use super::dialogs::{Outcome, buttons, title};
+use super::dialogs::{Outcome, buttons, title, valid_ref_name};
 use super::{Action, Dialog, Refresh, RepoTab, Undo};
 use crate::theme::Tokens;
 
@@ -239,7 +239,7 @@ pub(super) fn pick(
 ) -> bool {
     let mut changed = false;
     egui::ComboBox::from_id_salt(id)
-        .width(ui.available_width())
+        .width(ui.available_width().max(80.0))
         .selected_text(selected)
         .show_ui(ui, |ui| changed = show(ui));
     changed
@@ -284,7 +284,11 @@ impl Fetch {
             "Enable --force (overwrite diverged local refs)",
         );
         ui.add_space(8.0);
-        buttons(ui, "Fetch", true, enter, || self.action())
+        let valid = self
+            .remote
+            .and_then(|i| self.remotes.get(i))
+            .is_none_or(|r| valid_ref_name(r));
+        buttons(ui, "Fetch", valid, enter, || self.action())
     }
 
     fn action(&self) -> Action {
@@ -392,7 +396,11 @@ impl Pull {
             );
         }
         ui.add_space(8.0);
-        let valid = !self.current.is_empty() && !self.branch.is_empty();
+        let remote_ok = self
+            .remotes
+            .get(self.remote)
+            .is_some_and(|r| valid_ref_name(r));
+        let valid = remote_ok && !self.current.is_empty() && valid_ref_name(&self.branch);
         buttons(ui, "Pull", valid, enter, || self.action())
     }
 
@@ -475,7 +483,7 @@ impl Push {
         row(ui, t, "Remote branch", |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.remote_branch)
-                    .desired_width(ui.available_width())
+                    .desired_width(ui.available_width().max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
             )
         });
@@ -505,9 +513,15 @@ impl Push {
             );
         }
         ui.add_space(8.0);
-        let valid = self.locals.get(self.local).is_some()
-            && self.remotes.get(self.remote).is_some()
-            && !self.remote_branch.trim().is_empty();
+        let valid = self
+            .locals
+            .get(self.local)
+            .is_some_and(|(n, _)| valid_ref_name(n))
+            && self
+                .remotes
+                .get(self.remote)
+                .is_some_and(|r| valid_ref_name(r))
+            && valid_ref_name(&self.remote_branch);
         let label = if self.force { "Force push" } else { "Push" };
         buttons(ui, label, valid, enter, || self.action())
     }

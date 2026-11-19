@@ -25,6 +25,8 @@ struct ReflogDialog {
     selected: Option<usize>,
     filter: String,
     error: Option<String>,
+    loading: bool,
+    rx: Option<std::sync::mpsc::Receiver<Result<Vec<Entry>, String>>>,
 }
 
 /// `reflog --date=unix --format=hash FS selector FS subject`: with that date format the selector
@@ -69,23 +71,55 @@ fn load(repo: &std::path::Path) -> Result<Vec<Entry>, String> {
 }
 
 impl RepoTab {
-    pub(super) fn reflog_dialog(&self) -> Dialog {
-        let (entries, error) = match load(&self.path) {
-            Ok(entries) => (entries, None),
-            Err(e) => (Vec::new(), Some(e)),
-        };
+    pub(super) fn reflog_dialog(&self, ctx: &egui::Context) -> Dialog {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo = self.path.clone();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load(&repo));
+            wake.request_repaint();
+        });
         dialog(ReflogDialog {
-            entries,
+            entries: Vec::new(),
             selected: None,
             filter: String::new(),
-            error,
+            error: None,
+            loading: true,
+            rx: Some(rx),
         })
     }
 }
 
 impl DialogBody for ReflogDialog {
     fn ui(&mut self, ui: &mut Ui, t: &Tokens, _enter: bool) -> Outcome {
-        ui.set_width(640.0);
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.loading = false;
+                    self.rx = None;
+                    match res {
+                        Ok(entries) => {
+                            self.entries = entries;
+                            self.error = None;
+                        }
+                        Err(e) => {
+                            self.entries.clear();
+                            self.error = Some(e);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.loading = false;
+                    self.rx = None;
+                    if self.entries.is_empty() && self.error.is_none() {
+                        self.error = Some("Reflog loader terminated unexpectedly".to_owned());
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let width = (ui.ctx().content_rect().width() - 48.0).clamp(260.0, 640.0);
+        ui.set_width(width);
         title(
             ui,
             "Reflog",
@@ -108,6 +142,13 @@ impl DialogBody for ReflogDialog {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                if self.loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Loading reflog…").color(t.text_dim));
+                    });
+                    return;
+                }
                 for (i, e) in self.entries.iter().enumerate() {
                     if !filter.is_empty()
                         && !e.message.to_lowercase().contains(&filter)
@@ -141,12 +182,14 @@ impl DialogBody for ReflogDialog {
                         theme::mono(11.0),
                         t.text_faint,
                     );
+                    let msg_left = (rect.left() + 170.0).min(rect.right());
+                    let msg_right = (rect.right() - 96.0).max(msg_left);
                     p.with_clip_rect(egui::Rect::from_min_max(
-                        egui::pos2(rect.left() + 170.0, rect.top()),
-                        egui::pos2(rect.right() - 96.0, rect.bottom()),
+                        egui::pos2(msg_left, rect.top()),
+                        egui::pos2(msg_right, rect.bottom()),
                     ))
                     .text(
-                        egui::pos2(rect.left() + 170.0, y),
+                        egui::pos2(msg_left, y),
                         egui::Align2::LEFT_CENTER,
                         &e.message,
                         egui::FontId::proportional(12.5),
@@ -170,7 +213,7 @@ impl DialogBody for ReflogDialog {
         ui.add_space(8.0);
         let mut outcome = Outcome::Open;
         let picked = self.selected.and_then(|i| self.entries.get(i));
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(picked.is_some(), |ui| {
                 let hash = picked.map(|e| e.hash.clone()).unwrap_or_default();
                 if ui.button("Show in the graph").clicked() {
@@ -279,7 +322,7 @@ mod flow_tests {
     fn the_dialog_opens_and_a_folder_without_a_repository_is_an_error() {
         let dir = repo("rl-dialog");
         let f = Fixture::open(&dir);
-        assert!(matches!(f.tab.reflog_dialog(), Dialog::Ext(_)));
+        assert!(matches!(f.tab.reflog_dialog(&f.ctx), Dialog::Ext(_)));
         let plain = scratch("rl-not-a-repo");
         assert!(load(&plain).is_err());
         assert_eq!(load(&dir).map(|e| e.len()).unwrap_or(0), 1);

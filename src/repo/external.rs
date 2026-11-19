@@ -2,7 +2,8 @@
 //! diff and merge tools git uses for "Open in external diff tool".
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, mpsc};
 
 use egui::{RichText, Ui};
 
@@ -82,18 +83,38 @@ fn on_path(program: &str) -> bool {
     std::env::split_paths(&path).any(|dir| names.iter().any(|n| dir.join(n).is_file()))
 }
 
-/// The apps of [`APPS`] that are installed, looked for once.
+static FOUND_APPS: OnceLock<Vec<App>> = OnceLock::new();
+static SCANNING_APPS: AtomicBool = AtomicBool::new(false);
+
+fn scan_apps() -> Vec<App> {
+    APPS.iter()
+        .filter(|(_, program)| on_path(program))
+        .map(|(label, program)| App {
+            label: (*label).to_owned(),
+            program: (*program).to_owned(),
+        })
+        .collect()
+}
+
+/// The apps of [`APPS`] that are installed, looked for once (synchronously for tests).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn detected() -> &'static [App] {
-    static FOUND: OnceLock<Vec<App>> = OnceLock::new();
-    FOUND.get_or_init(|| {
-        APPS.iter()
-            .filter(|(_, program)| on_path(program))
-            .map(|(label, program)| App {
-                label: (*label).to_owned(),
-                program: (*program).to_owned(),
-            })
-            .collect()
-    })
+    FOUND_APPS.get_or_init(scan_apps)
+}
+
+/// Non-blocking scan of installed editors/IDEs on PATH (`None` while scanning).
+pub(super) fn detected_async(ctx: &egui::Context) -> Option<&'static [App]> {
+    if let Some(apps) = FOUND_APPS.get() {
+        return Some(apps.as_slice());
+    }
+    if !SCANNING_APPS.swap(true, Ordering::AcqRel) {
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = FOUND_APPS.set(scan_apps());
+            wake.request_repaint();
+        });
+    }
+    None
 }
 
 struct ExternalToolsDialog {
@@ -101,29 +122,64 @@ struct ExternalToolsDialog {
     merge: String,
     /// Save in the user's git config instead of this repository's.
     global: bool,
+    loading: bool,
+    edited_diff: bool,
+    edited_merge: bool,
+    rx: Option<mpsc::Receiver<(String, String)>>,
     _repo: PathBuf,
+}
+
+fn valid_tool_name(name: &str) -> bool {
+    let t = name.trim();
+    !t.is_empty() && !t.starts_with('-') && !t.chars().any(char::is_control)
+}
+
+fn read_configured_tools(repo: &std::path::Path) -> (String, String) {
+    let get = |key: &str| {
+        git::run(Some(repo), &["config", "--get", key])
+            .map(|v| v.trim().to_owned())
+            .unwrap_or_default()
+    };
+    (get("diff.tool"), get("merge.tool"))
 }
 
 impl ExternalToolsDialog {
     /// The tools git is configured with now.
+    #[cfg(test)]
     fn load(repo: &std::path::Path) -> ExternalToolsDialog {
-        let get = |key: &str| {
-            git::run(Some(repo), &["config", "--get", key])
-                .map(|v| v.trim().to_owned())
-                .unwrap_or_default()
-        };
+        let (diff, merge) = read_configured_tools(repo);
         ExternalToolsDialog {
-            diff: get("diff.tool"),
-            merge: get("merge.tool"),
+            diff,
+            merge,
             global: true,
+            loading: false,
+            edited_diff: false,
+            edited_merge: false,
+            rx: None,
             _repo: repo.to_path_buf(),
         }
     }
 }
 
 impl RepoTab {
-    pub(super) fn external_tools_dialog(&self) -> Dialog {
-        dialog(ExternalToolsDialog::load(&self.path))
+    pub(super) fn external_tools_dialog(&self, ctx: &egui::Context) -> Dialog {
+        let (tx, rx) = mpsc::channel();
+        let repo = self.path.clone();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_configured_tools(&repo));
+            wake.request_repaint();
+        });
+        dialog(ExternalToolsDialog {
+            diff: String::new(),
+            merge: String::new(),
+            global: true,
+            loading: true,
+            edited_diff: false,
+            edited_merge: false,
+            rx: Some(rx),
+            _repo: self.path.clone(),
+        })
     }
 }
 
@@ -151,14 +207,14 @@ fn config_steps(d: &ExternalToolsDialog) -> Vec<Vec<String>> {
     steps
 }
 
-fn tool_row(ui: &mut Ui, t: &Tokens, label: &str, id: &str, value: &mut String) {
+fn tool_row(ui: &mut Ui, t: &Tokens, label: &str, id: &str, value: &mut String) -> bool {
     row(ui, t, label, |ui| {
         let text = if value.is_empty() {
             "Not set".to_owned()
         } else {
             value.clone()
         };
-        let changed = pick(ui, id, &text, |ui| {
+        pick(ui, id, &text, |ui| {
             let mut changed = false;
             for tool in TOOLS {
                 if ui.selectable_label(value == tool, *tool).clicked() {
@@ -167,21 +223,50 @@ fn tool_row(ui: &mut Ui, t: &Tokens, label: &str, id: &str, value: &mut String) 
                 }
             }
             changed
-        });
-        let _ = changed;
-    });
+        })
+    })
 }
 
 impl DialogBody for ExternalToolsDialog {
     fn ui(&mut self, ui: &mut Ui, t: &Tokens, enter: bool) -> Outcome {
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok((diff, merge)) => {
+                    self.loading = false;
+                    self.rx = None;
+                    if !self.edited_diff {
+                        self.diff = diff;
+                    }
+                    if !self.edited_merge {
+                        self.merge = merge;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.loading = false;
+                    self.rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         title(
             ui,
             "External diff and merge tools",
             "What \"Open in external diff tool\" and \"Open in merge tool\" start (git difftool / mergetool).",
             t,
         );
-        tool_row(ui, t, "Diff tool", "ext-diff", &mut self.diff);
-        tool_row(ui, t, "Merge tool", "ext-merge", &mut self.merge);
+        if self.loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Loading configured tools…").color(t.text_faint));
+            });
+            ui.add_space(4.0);
+        }
+        if tool_row(ui, t, "Diff tool", "ext-diff", &mut self.diff) {
+            self.edited_diff = true;
+        }
+        if tool_row(ui, t, "Merge tool", "ext-merge", &mut self.merge) {
+            self.edited_merge = true;
+        }
         ui.add_space(4.0);
         ui.checkbox(
             &mut self.global,
@@ -193,7 +278,11 @@ impl DialogBody for ExternalToolsDialog {
                 .small(),
         );
         ui.add_space(8.0);
-        let valid = !self.diff.trim().is_empty() || !self.merge.trim().is_empty();
+        let diff_ok = self.diff.trim().is_empty() || valid_tool_name(&self.diff);
+        let merge_ok = self.merge.trim().is_empty() || valid_tool_name(&self.merge);
+        let valid = (!self.diff.trim().is_empty() || !self.merge.trim().is_empty())
+            && diff_ok
+            && merge_ok;
         buttons(ui, "Save", valid, enter, || Action::Ops {
             label: "Save external tools".to_owned(),
             ops: config_steps(self),
@@ -212,6 +301,10 @@ mod tests {
             diff: "meld".into(),
             merge: String::new(),
             global: false,
+            loading: false,
+            edited_diff: false,
+            edited_merge: false,
+            rx: None,
             _repo: PathBuf::new(),
         };
         let steps = config_steps(&d);
@@ -243,6 +336,10 @@ mod flow_tests {
             diff: "meld".to_owned(),
             merge: "kdiff3".to_owned(),
             global: false,
+            loading: false,
+            edited_diff: false,
+            edited_merge: false,
+            rx: None,
             _repo: dir.clone(),
         };
         f.run(Action::Ops {
@@ -268,7 +365,7 @@ mod flow_tests {
             (again.diff.as_str(), again.merge.as_str()),
             ("meld", "kdiff3")
         );
-        assert!(matches!(f.tab.external_tools_dialog(), Dialog::Ext(_)));
+        assert!(matches!(f.tab.external_tools_dialog(&f.ctx), Dialog::Ext(_)));
     }
 
     #[test]

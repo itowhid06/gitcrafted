@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 use syntect::highlighting::{
@@ -31,26 +31,53 @@ pub fn enabled() -> bool {
 }
 
 /// The theme selected in VS Code; `None` when VS Code isn't installed or its theme can't be
-/// found. Reloaded when VS Code's settings file changes.
+/// found. Reloaded at most every few seconds when VS Code's settings file changes.
 pub fn current() -> Option<Arc<EditorTheme>> {
-    type Cache = Option<(PathBuf, Option<SystemTime>, Option<Arc<EditorTheme>>)>;
-    static CACHE: Mutex<Cache> = Mutex::new(None);
-
-    let editor = installed_editors()
-        .into_iter()
-        .find(|e| e.settings.is_file())?;
-    let modified = std::fs::metadata(&editor.settings)
-        .and_then(|m| m.modified())
-        .ok();
-    let mut cache = CACHE.lock().ok()?;
-    if let Some((path, when, theme)) = cache.as_ref()
-        && *path == editor.settings
-        && *when == modified
-    {
-        return theme.clone();
+    struct CacheEntry {
+        checked_at: Instant,
+        path: Option<PathBuf>,
+        modified: Option<SystemTime>,
+        theme: Option<Arc<EditorTheme>>,
     }
-    let theme = load(&editor).map(Arc::new);
-    *cache = Some((editor.settings.clone(), modified, theme.clone()));
+    static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
+    static EDITORS: OnceLock<Vec<Editor>> = OnceLock::new();
+
+    let mut cache = match CACHE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(entry) = cache.as_ref()
+        && entry.checked_at.elapsed() < Duration::from_secs(3)
+    {
+        return entry.theme.clone();
+    }
+
+    let editors = EDITORS.get_or_init(installed_editors);
+    let candidate = editors.iter().find(|e| e.settings.is_file());
+    let path = candidate.map(|e| e.settings.clone());
+    let modified = path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+
+    if let Some(entry) = cache.as_mut()
+        && entry.path == path
+        && entry.modified == modified
+    {
+        entry.checked_at = Instant::now();
+        return entry.theme.clone();
+    }
+
+    let theme = editors
+        .iter()
+        .filter(|e| e.settings.is_file())
+        .find_map(load)
+        .map(Arc::new);
+    *cache = Some(CacheEntry {
+        checked_at: Instant::now(),
+        path,
+        modified,
+        theme: theme.clone(),
+    });
     theme
 }
 
@@ -211,7 +238,9 @@ fn find_theme(dirs: &[PathBuf], name: &str) -> Option<(PathBuf, bool)> {
                 if id != Some(name) && label.as_deref() != Some(name) {
                     continue;
                 }
-                let path = t.get("path").and_then(Value::as_str)?;
+                let Some(path) = t.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
                 let ui = t
                     .get("uiTheme")
                     .and_then(Value::as_str)
@@ -233,7 +262,10 @@ fn read_theme(path: &Path, depth: u32) -> Option<ThemeFile> {
     }
     let json = read_jsonc(path)?;
     let (mut colors, mut rules, mut kind) = match json.get("include").and_then(Value::as_str) {
-        Some(inc) => read_theme(&path.parent()?.join(inc), depth + 1)?,
+        Some(inc) => path
+            .parent()
+            .and_then(|dir| read_theme(&dir.join(inc), depth + 1))
+            .unwrap_or_default(),
         None => Default::default(),
     };
     if let Some(c) = json.get("colors").and_then(Value::as_object) {
@@ -275,6 +307,8 @@ fn build(name: &str, colors: &serde_json::Map<String, Value>, rules: &[Value]) -
             Some(Value::Array(list)) => list
                 .iter()
                 .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join(", "),
             // A rule without a scope sets the defaults.

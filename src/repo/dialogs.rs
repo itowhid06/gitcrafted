@@ -43,6 +43,7 @@ pub enum Dialog {
         refresh: Refresh,
         undo: Undo,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
     Stash {
         message: String,
         focus: bool,
@@ -151,6 +152,7 @@ impl Dialog {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stash() -> Self {
         Dialog::Stash {
             message: String::new(),
@@ -259,12 +261,50 @@ pub(crate) enum Outcome {
     Open,
     /// Still open; the branch changed, so suggest a folder again.
     Suggest,
+    /// Still open; start the non-blocking Apply Patch file picker.
+    PickApplyPatch,
     Cancel,
     Done(Action),
 }
 
+pub(super) fn valid_ref_name(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.starts_with('/')
+        && !s.ends_with('/')
+        && !s.ends_with('.')
+        && !s.ends_with(".lock")
+        && !s.contains("..")
+        && !s.contains("//")
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && !s.chars().any(char::is_whitespace)
+}
+
+fn dialog_id(dialog: &Dialog) -> egui::Id {
+    let tag = match dialog {
+        Dialog::CreateBranch { .. } => "create-branch",
+        Dialog::AddWorktree { .. } => "add-worktree",
+        Dialog::Confirm { .. } => "confirm",
+        Dialog::Stash { .. } => "stash",
+        Dialog::Tag { .. } => "tag",
+        Dialog::RenameBranch { .. } => "rename-branch",
+        Dialog::Remote { .. } => "remote",
+        Dialog::Apply(_) => "apply-patch",
+        Dialog::Ext(_) => "ext",
+        Dialog::Sync(_) => "sync",
+        Dialog::AddSubmodule { .. } => "add-submodule",
+        Dialog::Credentials { .. } => "credentials",
+        Dialog::CreatePr { .. } => "create-pr",
+    };
+    egui::Id::new(("gitcrafted-dialog", tag))
+}
+
 impl RepoTab {
     pub(super) fn dialogs(&mut self, ctx: &egui::Context, acts: &mut Vec<Action>) {
+        let idle = self.busy_op.is_none();
+        let allow_keys = !self.keys_blocked && !egui::Popup::is_any_open(ctx);
         let Some(dialog) = &mut self.dialog else {
             return;
         };
@@ -275,7 +315,7 @@ impl RepoTab {
             .corner_radius(t.radius_lg)
             .inner_margin(egui::Margin::same(18))
             .shadow(ctx.global_style().visuals.window_shadow);
-        let modal = egui::Modal::new(egui::Id::new("gitcrafted-dialog"))
+        let modal = egui::Modal::new(dialog_id(dialog))
             .frame(frame)
             .backdrop_color(egui::Color32::from_black_alpha(110));
 
@@ -287,9 +327,11 @@ impl RepoTab {
             .current
             .clone()
             .unwrap_or_else(|| self.refs.head.clone());
+        let modal_w = (ctx.content_rect().width() - 32.0).clamp(260.0, 380.0);
+        let mut pick_worktree = false;
         let response = modal.show(ctx, |ui| {
-            ui.set_width(380.0);
-            let enter = ui.input(|i| i.key_pressed(Key::Enter));
+            ui.set_width(modal_w);
+            let enter = allow_keys && idle && ui.input(|i| i.key_pressed(Key::Enter));
             match dialog {
                 Dialog::CreateBranch {
                     at,
@@ -318,7 +360,7 @@ impl RepoTab {
                     ui.add_space(6.0);
                     ui.checkbox(checkout, "Check it out");
                     ui.add_space(12.0);
-                    let valid = !name.trim().is_empty();
+                    let valid = idle && valid_ref_name(name);
                     let mut outcome = Outcome::Open;
                     ui.horizontal(|ui| {
                         if widgets::primary_button(ui, "Create", valid, 90.0).clicked()
@@ -438,7 +480,7 @@ impl RepoTab {
                     ui.horizontal(|ui| {
                         let edit = ui.add(
                             egui::TextEdit::singleline(path)
-                                .desired_width(ui.available_width() - 90.0)
+                                .desired_width((ui.available_width() - 90.0).max(80.0))
                                 .margin(egui::Margin::symmetric(8, 6)),
                         );
                         if edit.changed() {
@@ -447,21 +489,18 @@ impl RepoTab {
                         if ui
                             .add(egui::Button::new("Browse…").min_size(egui::vec2(80.0, 28.0)))
                             .clicked()
-                            && let Some(dir) = rfd::FileDialog::new()
-                                .set_title("Worktree folder")
-                                .pick_folder()
                         {
-                            *path = dir.display().to_string();
-                            *path_edited = true;
+                            pick_worktree = true;
                         }
                     });
                     ui.add_space(12.0);
                     let name_ok = if *new_branch {
-                        !new_name.trim().is_empty()
+                        valid_ref_name(new_name)
                     } else {
-                        !branch.is_empty()
+                        !branch.is_empty() && valid_ref_name(branch)
                     };
-                    let valid = name_ok && !path.trim().is_empty();
+                    let p = path.trim();
+                    let valid = idle && name_ok && !p.is_empty() && !p.starts_with('-');
                     let mut outcome = Outcome::Open;
                     ui.horizontal(|ui| {
                         if widgets::primary_button(ui, "Add", valid, 90.0).clicked()
@@ -510,7 +549,7 @@ impl RepoTab {
                     title(ui, "Stash changes", "Puts every change, untracked files included, aside and cleans the working tree.", &t);
                     let edit = field(ui, message, "Message (optional)", focus);
                     let _ = edit;
-                    buttons(ui, "Stash", true, enter, || Action::StashPush(message.trim().to_owned()))
+                    buttons(ui, "Stash", idle, enter, || Action::StashPush(message.trim().to_owned()))
                 }
                 Dialog::Tag { at, at_label, name, message, remote, push, focus } => {
                     title(ui, "Create tag", &format!("At {at_label}"), &t);
@@ -531,7 +570,7 @@ impl RepoTab {
                         ui.checkbox(push, format!("Push it to {remote}"));
                     }
                     ui.add_space(8.0);
-                    let valid = !name.trim().is_empty();
+                    let valid = idle && valid_ref_name(name);
                     buttons(ui, "Create", valid, enter && !message.contains('\n'), || {
                         let name = name.trim().to_owned();
                         let mut create = vec!["tag".to_owned()];
@@ -561,7 +600,7 @@ impl RepoTab {
                         *new = new.replace(' ', "-");
                     }
                     ui.add_space(8.0);
-                    let valid = !new.trim().is_empty() && new.trim() != old.as_str();
+                    let valid = idle && valid_ref_name(new) && new.trim() != old.as_str();
                     buttons(ui, "Rename", valid, enter, || {
                         let new = new.trim().to_owned();
                         Action::UndoableOps {
@@ -587,7 +626,8 @@ impl RepoTab {
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
                     ui.add_space(8.0);
-                    let valid = !name.trim().is_empty() && !url.trim().is_empty();
+                    let url_t = url.trim();
+                    let valid = idle && valid_ref_name(name) && !url_t.is_empty() && !url_t.starts_with('-');
                     buttons(ui, if original.is_some() { "Save" } else { "Add" }, valid, enter, || {
                         let (name, url) = (name.trim().to_owned(), url.trim().to_owned());
                         let steps = match original {
@@ -632,7 +672,15 @@ impl RepoTab {
                         *path_edited = true;
                     }
                     ui.add_space(8.0);
-                    let valid = !url.trim().is_empty() && !path.trim().is_empty();
+                    let url_t = url.trim();
+                    let path_t = path.trim();
+                    let path_safe = !path_t.is_empty()
+                        && !path_t.starts_with('-')
+                        && !Path::new(path_t).is_absolute()
+                        && !Path::new(path_t)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir));
+                    let valid = idle && !url_t.is_empty() && !url_t.starts_with('-') && path_safe;
                     buttons(ui, "Add", valid, enter, || Action::Ops {
                         label: format!("Add submodule {}", path.trim()),
                         ops: super::submodules::add_ops(url.trim(), path.trim()),
@@ -692,7 +740,7 @@ impl RepoTab {
                         ui.checkbox(draft, "Draft");
                     });
                     ui.add_space(8.0);
-                    let valid = !pr_title.trim().is_empty() && !base.trim().is_empty();
+                    let valid = idle && !pr_title.trim().is_empty() && valid_ref_name(base);
                     buttons(ui, "Create", valid, false, || Action::CreatePr {
                         branch: branch.clone(),
                         base: base.trim().to_owned(),
@@ -728,7 +776,7 @@ impl RepoTab {
                         )
                         .fill(t.danger)
                         .min_size(egui::vec2(90.0, 30.0));
-                        if ui.add(danger).clicked() {
+                        if ui.add_enabled(idle, danger).clicked() {
                             let steps = match (alternative, *use_alternative) {
                                 (Some((_, alt)), true) => alt.clone(),
                                 _ => ops.clone(),
@@ -760,14 +808,19 @@ impl RepoTab {
         });
 
         match response.inner {
-            Outcome::Done(action) => {
+            Outcome::Done(action) if idle => {
                 acts.push(action);
                 self.dialog = None;
             }
+            Outcome::Done(_) => {}
             Outcome::Cancel => self.dialog = None,
-            Outcome::Open if response.should_close() => self.dialog = None,
+            Outcome::Open if allow_keys && response.should_close() => self.dialog = None,
             Outcome::Open => {}
             Outcome::Suggest => dialog.suggest_path(),
+            Outcome::PickApplyPatch => self.pick_apply_patch(ctx),
+        }
+        if pick_worktree {
+            self.pick_worktree_dir(ctx);
         }
     }
 }
