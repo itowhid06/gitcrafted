@@ -551,7 +551,6 @@ mod commit_push_tests {
         let (work, bare) = repo_with_remote("cp-retry");
         // The remote refuses the first push only (as a server asking for credentials would).
         let marker = bare.join("refused-once");
-        let hook = bare.join("hooks/pre-receive");
         write(
             &bare,
             "hooks/pre-receive",
@@ -563,6 +562,7 @@ mod commit_push_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let hook = bare.join("hooks/pre-receive");
             let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755));
         }
         let mut f = Fixture::open(&work);

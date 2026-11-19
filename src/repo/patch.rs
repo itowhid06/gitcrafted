@@ -1081,6 +1081,8 @@ mod safety_tests {
         }
     }
 
+    // A file called `*.txt` can't exist on Windows.
+    #[cfg(unix)]
     #[test]
     fn a_patch_of_a_file_named_like_a_pattern_holds_only_that_file() {
         let dir = repo("sf-patch-glob");

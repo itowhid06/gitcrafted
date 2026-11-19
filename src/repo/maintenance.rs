@@ -883,17 +883,23 @@ mod safety_tests {
     }
 
     fn odd_names() -> Vec<&'static str> {
+        // Names git passes through unquoted or quoted, that look like patterns or options.
         let mut names = vec![
-            "*.txt",
             "[ab].txt",
             " lead space.txt",
             "-dash.txt",
             "ümlaut.txt",
-            "quote\"s.txt",
             "semi;colon.txt",
         ];
+        // Windows has no files called `*.txt`, `a"b` or with a backslash, tab or line break.
         if cfg!(unix) {
-            names.extend(["back\\slash.txt", "tab\tname.txt", "new\nline.txt"]);
+            names.extend([
+                "*.txt",
+                "quote\"s.txt",
+                "back\\slash.txt",
+                "tab\tname.txt",
+                "new\nline.txt",
+            ]);
         }
         names.sort_unstable();
         names
@@ -1004,6 +1010,9 @@ mod safety_tests {
     #[test]
     fn the_reflog_list_of_older_gits_matches_the_new_one() {
         let dir = precious("sf-reflog-files");
+        if !git_ok(&dir, &["reflog", "list"]) {
+            return; // git before 2.44 has no `reflog list`: the files are all there is
+        }
         git(&dir, &["checkout", "-q", "-b", "feat/deep/name"]);
         git(&dir, &["checkout", "-q", "main"]);
         let mut new: Vec<String> = git(&dir, &["reflog", "list"])

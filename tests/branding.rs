@@ -14,7 +14,9 @@ fn root() -> PathBuf {
 }
 
 fn read(rel: &str) -> String {
+    // A Windows checkout may have turned the line breaks into CRLF.
     std::fs::read_to_string(root().join(rel))
+        .map(|s| s.replace("\r\n", "\n"))
         .unwrap_or_else(|e| format!("<could not read {rel}: {e}>"))
 }
 

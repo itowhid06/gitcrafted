@@ -61,6 +61,21 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// What the repository in `dir` needs to behave the same on every machine: its own author (the
+/// actions under test commit, stash, merge and rebase without the -c flags the helpers pass, and
+/// CI machines have no global identity), no signing, and no line-ending conversion (Git for
+/// Windows converts by default, which would change the bytes tests compare).
+pub fn configure(dir: &Path) {
+    for (key, value) in [
+        ("user.name", "Tester"),
+        ("user.email", "tester@example.com"),
+        ("commit.gpgsign", "false"),
+        ("core.autocrlf", "false"),
+    ] {
+        let _ = command(dir, &["config", key, value]).output();
+    }
+}
+
 /// Runs git in `dir`; fails the test with git's message when it fails. Returns stdout, trimmed.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let out = command(dir, args).output();
@@ -73,6 +88,19 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&o.stderr)
     );
+    // A repository the command just made gets its configuration at once.
+    match args.first() {
+        Some(&"init") if !args.contains(&"--bare") => configure(dir),
+        Some(&"clone") => {
+            if let Some(target) = args.last() {
+                let target = dir.join(target);
+                if target.join(".git").exists() {
+                    configure(&target);
+                }
+            }
+        }
+        _ => {}
+    }
     String::from_utf8_lossy(&o.stdout).trim().to_owned()
 }
 
@@ -162,6 +190,7 @@ pub struct Fixture {
 impl Fixture {
     /// Opens a tab on `dir` and waits for its first load.
     pub fn open(dir: &Path) -> Fixture {
+        configure(dir);
         let ctx = egui::Context::default();
         let tab = RepoTab::new(dir.to_path_buf(), &ctx);
         let mut f = Fixture { ctx, tab };

@@ -819,6 +819,8 @@ mod safety_tests {
         }
     }
 
+    // A file called `*.txt` can't exist on Windows.
+    #[cfg(unix)]
     #[test]
     fn stashing_a_selected_file_named_like_a_pattern_takes_only_that_file() {
         let dir = repo("sf-stash-glob");
@@ -998,6 +1000,8 @@ mod safety_tests {
         assert_eq!(read(&dir, "f.txt"), "edited after the merge\n");
     }
 
+    // A file called `*.txt` can't exist on Windows.
+    #[cfg(unix)]
     #[test]
     fn per_file_discard_and_delete_touch_only_that_file() {
         let dir = repo("sf-discard-glob");
