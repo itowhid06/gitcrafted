@@ -52,6 +52,8 @@ pub enum ExtAction {
     DiffTool { path: String, staged: bool },
     /// A conflicted file in the merge tool git is configured with.
     MergeTool { path: String },
+    /// Replace the repository's issue link rules.
+    SaveIssueRules(Vec<super::issues::Rule>),
 }
 
 impl RepoTab {
@@ -95,6 +97,11 @@ impl RepoTab {
                         ],
                     );
                 }
+            }
+            ExtAction::SaveIssueRules(rules) => {
+                self.save_issue_rules(&rules);
+                self.forget_issue_rules(ctx);
+                self.status = Some(("Issue links saved".to_owned(), false));
             }
         }
     }
@@ -189,6 +196,34 @@ impl RepoTab {
 
     /// The entries of the toolbar's Tools menu.
     pub(super) fn tools_menu(&self, ui: &mut Ui, acts: &mut Vec<Action>) {
+        let idle = self.busy_op.is_none();
+        if ui.button("Reflog…").clicked() {
+            acts.push(Action::Dialog(self.reflog_dialog()));
+        }
+        if self.bisecting(ui.ctx()) {
+            if ui
+                .add_enabled(idle, egui::Button::new("Stop bisect"))
+                .clicked()
+            {
+                acts.push(super::bisect::stop_action());
+            }
+        } else if ui
+            .add_enabled(idle, egui::Button::new("Start bisect…"))
+            .clicked()
+        {
+            acts.push(Action::Dialog(self.bisect_dialog(None, None)));
+        }
+        if super::lfs::available() && ui.button("Git LFS…").clicked() {
+            acts.push(Action::Dialog(self.lfs_dialog()));
+        }
+        ui.separator();
+        if ui.button("Maintenance…").clicked() {
+            acts.push(Action::Dialog(self.maintenance_dialog()));
+        }
+        if ui.button("Clean untracked files…").clicked() {
+            acts.push(Action::Dialog(self.clean_dialog()));
+        }
+        ui.separator();
         ui.menu_button("Open repository in", |ui| {
             let apps = super::external::detected();
             if apps.is_empty() {
@@ -207,6 +242,9 @@ impl RepoTab {
         });
         if ui.button("External diff and merge tools…").clicked() {
             acts.push(Action::Dialog(self.external_tools_dialog()));
+        }
+        if ui.button("Issue links…").clicked() {
+            acts.push(Action::Dialog(self.issue_dialog(ui.ctx())));
         }
     }
 
@@ -233,6 +271,7 @@ impl RepoTab {
                 },
             )));
         }
+        self.bisect_menu_items(ui, acts, hash, idle);
     }
 }
 

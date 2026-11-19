@@ -88,6 +88,7 @@ impl RepoTab {
         // Taken out while the pane borrows `self`; put back after it.
         let mut reword = self.reword.take();
         let head = self.refs.head.clone();
+        let issue_rules = self.issue_rules(ui.ctx());
         egui::ScrollArea::vertical()
             .id_salt("detail_scroll")
             .auto_shrink(false)
@@ -126,12 +127,13 @@ impl RepoTab {
                                 } else {
                                     Sense::hover()
                                 };
-                                let summary = ui.add(
-                                    egui::Label::new(
-                                        RichText::new(subject).font(theme::semibold(15.0)),
-                                    )
-                                    .wrap()
-                                    .sense(sense),
+                                let summary = super::issues::linked_text(
+                                    ui,
+                                    subject,
+                                    theme::semibold(15.0),
+                                    t.text,
+                                    &issue_rules,
+                                    sense,
                                 );
                                 let mut clicked = if editable {
                                     summary.on_hover_text("Double-click to edit the message")
@@ -145,13 +147,15 @@ impl RepoTab {
                                 .double_clicked();
                                 if !body.is_empty() {
                                     ui.add_space(2.0);
-                                    clicked |= ui
-                                        .add(
-                                            egui::Label::new(RichText::new(body).color(t.text_dim))
-                                                .wrap()
-                                                .sense(sense),
-                                        )
-                                        .double_clicked();
+                                    clicked |= super::issues::linked_text(
+                                        ui,
+                                        body,
+                                        egui::TextStyle::Body.resolve(ui.style()),
+                                        t.text_dim,
+                                        &issue_rules,
+                                        sense,
+                                    )
+                                    .double_clicked();
                                 }
                                 if clicked && editable {
                                     reword = Some(Reword {

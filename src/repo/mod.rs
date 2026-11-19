@@ -8,10 +8,15 @@ mod diff;
 mod file_view;
 mod graph_view;
 mod highlight;
+mod bisect;
 mod branch_ops;
 mod ext;
 mod external;
+mod issues;
+mod lfs;
+mod maintenance;
 mod patch;
+mod reflog;
 mod rebase;
 mod rewrite;
 mod sidebar;
@@ -2219,6 +2224,7 @@ impl RepoTab {
                     .stroke(egui::Stroke::new(1.0, t.separator)),
             )
             .show(ui, |ui| self.toolbar(ui, &mut acts));
+        self.bisect_bar(ui, &mut acts);
         let side = egui::Frame::new().fill(t.card);
         egui::Panel::left("repo_branches")
             .resizable(true)
