@@ -8,6 +8,7 @@ mod diff;
 mod file_view;
 mod graph_view;
 mod highlight;
+mod branch_ops;
 mod ext;
 mod external;
 mod patch;
@@ -454,6 +455,8 @@ pub struct RepoTab {
     pending_edit: Option<String>,
     /// Files Ctrl+clicked in the Changes lists, to save as a patch.
     patch_sel: Vec<StatusFile>,
+    /// Where a Commit & Push is: waiting for the commit, or pushing after it.
+    push_follow: ext::PushFollow,
 
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
@@ -545,6 +548,7 @@ impl RepoTab {
             pending_goto: None,
             pending_edit: None,
             patch_sel: Vec::new(),
+            push_follow: ext::PushFollow::Idle,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             busy_op: None,
@@ -1761,6 +1765,9 @@ impl RepoTab {
                         self.dialog = Some(Dialog::credentials(&url, refused));
                     }
                     Err(e) => {
+                        if let Some(dialog) = branch_ops::blocked_checkout(&label, e) {
+                            self.dialog = Some(dialog);
+                        }
                         self.focus_wip = e.contains("CONFLICT") || e.contains("could not apply");
                         self.status = Some((format!("{label} failed: {e}"), true));
                         // A failed undo stays undoable.
@@ -1784,6 +1791,7 @@ impl RepoTab {
                     Refresh::Status => self.reload_status(ctx),
                     Refresh::All => self.reload(ctx),
                 }
+                self.after_op(&label, &result, ctx);
             }
         }
     }
@@ -2333,7 +2341,7 @@ impl RepoTab {
                 .on_disabled_hover_text("No changes to stash")
                 .clicked()
             {
-                acts.push(Action::Dialog(Dialog::stash()));
+                acts.push(Action::Dialog(self.stash_dialog()));
             }
             let terminal = icons::tool_button(ui, "square-terminal", "Terminal", true)
                 .on_hover_text("Terminal in the repository folder");
@@ -2478,7 +2486,7 @@ impl RepoTab {
             (
                 "Stash changes".into(),
                 "stash".into(),
-                Action::Dialog(Dialog::stash()),
+                Action::Dialog(self.stash_dialog()),
             ),
             (
                 "Search commits".into(),
@@ -2583,12 +2591,7 @@ pub(crate) fn compare_action(base: &str, target: &str, since_fork: bool) -> Acti
 }
 
 pub(crate) fn merge_action(branch: &str, current: &str) -> Action {
-    Action::UndoableOps {
-        label: format!("Merge {branch} into {current}"),
-        ops: ops(&[&["merge", "--no-edit", branch]]),
-        refresh: Refresh::All,
-        undo: Undo::HeadMove { mode: "--keep" },
-    }
+    Action::Dialog(branch_ops::merge_dialog(branch, current))
 }
 
 /// Moves the current branch forward to `branch`; fails (and says so) if they have diverged.

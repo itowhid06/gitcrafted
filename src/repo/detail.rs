@@ -660,7 +660,31 @@ impl RepoTab {
         // Only from the message fields, so Ctrl+Enter in the terminal stays the shell's.
         let shortcut = (summary.has_focus() || body.has_focus())
             && ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
-        let resp = widgets::primary_button(ui, &label, can, ui.available_width());
+        // Next to it, commit and push in one go.
+        let push_w = if rebasing || self.remotes.is_empty() {
+            0.0
+        } else {
+            96.0
+        };
+        let resp = ui
+            .horizontal(|ui| {
+                let resp = widgets::primary_button(
+                    ui,
+                    &label,
+                    can,
+                    ui.available_width() - push_w - ui.spacing().item_spacing.x * (push_w > 0.0) as u8 as f32,
+                );
+                if push_w > 0.0
+                    && ui
+                        .add_enabled(can, egui::Button::new("& Push").min_size(egui::vec2(push_w, 30.0)))
+                        .on_hover_text("Commit, then push the branch")
+                        .clicked()
+                {
+                    acts.push(Action::Ext(super::ext::ExtAction::CommitPush));
+                }
+                resp
+            })
+            .inner;
         if (resp.clicked() || (shortcut && can)) && can {
             acts.push(Action::Commit);
         }
@@ -721,7 +745,7 @@ fn stage_action(label: &str, steps: Vec<Vec<&str>>) -> Action {
     }
 }
 
-fn discard_dialog(f: &StatusFile) -> Dialog {
+pub(super) fn discard_dialog(f: &StatusFile) -> Dialog {
     if f.area == Area::Untracked {
         Dialog::confirm(
             "Delete new file",
@@ -730,7 +754,7 @@ fn discard_dialog(f: &StatusFile) -> Dialog {
                 f.path
             ),
             "Delete file",
-            ops(&[&["clean", "-f", "-q", "--", &f.path]]),
+            ops(&[&["clean", "-f", "-q", "--", &super::ext::literal(&f.path)]]),
             None,
         )
         .refresh(Refresh::Status)
@@ -742,7 +766,7 @@ fn discard_dialog(f: &StatusFile) -> Dialog {
                 f.path
             ),
             "Discard",
-            ops(&[&["restore", "--", &f.path]]),
+            ops(&[&["restore", "--", &super::ext::literal(&f.path)]]),
             None,
         )
         .refresh(Refresh::Status)

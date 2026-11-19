@@ -613,7 +613,7 @@ impl RepoTab {
             Some(("plus", "Stash changes…")),
         );
         if add && idle && !self.work.is_clean() {
-            acts.push(Action::Dialog(Dialog::stash()));
+            acts.push(Action::Dialog(self.stash_dialog()));
         }
         if !open {
             return;
