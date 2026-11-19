@@ -144,7 +144,6 @@ impl App {
         theme::install_fonts(ctx);
         theme::apply(ctx, saved.theme);
         saved.settings.set(ctx);
-        crate::desktop_entry::refresh();
 
         let mut app = Self {
             git_version: git::version(),
@@ -620,7 +619,7 @@ impl App {
                                 .show(ui, |ui| {
                                     ui.label(
                                         RichText::new(format!(
-                                            "gitcraft {} is out (you have {}).",
+                                            "gitcrafted {} is out (you have {}).",
                                             release.version,
                                             update::CURRENT
                                         ))
@@ -673,8 +672,8 @@ impl App {
                     ui.set_max_width(640.0);
                     ui.add_space((ui.available_height() * 0.10).max(32.0));
                     ui.horizontal(|ui| {
-                        icons::inline(ui, "git-merge", 34.0, t.accent);
-                        ui.label(RichText::new("gitcraft").font(theme::semibold(30.0)));
+                        logo(ui, 48.0);
+                        ui.label(RichText::new("gitcrafted").font(theme::semibold(30.0)));
                     });
                     ui.add_space(4.0);
                     if let Ok(v) = &self.git_version {
@@ -683,15 +682,15 @@ impl App {
                             ui.label(RichText::new(v).color(t.text_dim));
                         });
                     }
-                    if let Some(appimage) = crate::desktop_entry::appimage()
+                    if let Some(exe) = crate::desktop_entry::target()
                         && !crate::desktop_entry::installed()
                     {
                         ui.add_space(4.0);
                         let link = ui
-                            .link("Add gitcraft to the applications menu")
-                            .on_hover_text(appimage.display().to_string());
+                            .link("Add gitcrafted to the applications menu")
+                            .on_hover_text(exe.display().to_string());
                         if link.clicked() {
-                            self.error = crate::desktop_entry::install(&appimage).err();
+                            self.error = crate::desktop_entry::install(&exe).err();
                         }
                     }
                     ui.add_space(26.0);
@@ -972,7 +971,7 @@ impl App {
             ui.add_space(8.0);
             ui.label(RichText::new("Git was not found").font(theme::semibold(24.0)));
             ui.add_space(8.0);
-            ui.label("gitcraft uses the git command line. Install git and make sure `git` is on your PATH.");
+            ui.label("gitcrafted uses the git command line. Install git and make sure `git` is on your PATH.");
             ui.add_space(4.0);
             ui.label(RichText::new(err).color(t.text_faint).small());
             ui.add_space(16.0);
@@ -1153,8 +1152,18 @@ impl eframe::App for App {
 
 /// The window and taskbar icon (the `.exe` gets the same picture from `build.rs`).
 pub fn window_icon() -> egui::IconData {
-    eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon/gitcraft-256.png"))
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon/gitcrafted-256.png"))
         .unwrap_or_default()
+}
+
+/// The logo at `size` points: the simplified drawing up to 32, which stays readable when small.
+pub(crate) fn logo(ui: &mut Ui, size: f32) -> egui::Response {
+    let source = if size <= 32.0 {
+        egui::include_image!("../assets/app-icon/gitcrafted-small.svg")
+    } else {
+        egui::include_image!("../assets/app-icon/gitcrafted.svg")
+    };
+    ui.add(egui::Image::new(source).fit_to_exact_size(vec2(size, size)))
 }
 
 /// A large clickable card on the start page.
@@ -1529,9 +1538,10 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_width(640.0);
                 ui.horizontal(|ui| {
+                    logo(ui, 24.0);
                     ui.label(RichText::new("Manual").font(theme::semibold(16.0)));
                     ui.label(
-                        RichText::new(format!("gitcraft {}", update::CURRENT)).color(t.text_faint),
+                        RichText::new(format!("gitcrafted {}", update::CURRENT)).color(t.text_faint),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::small_button(ui, "x", "Close (Esc)").clicked() {
@@ -1605,8 +1615,8 @@ fn notify(text: &str) {
     let text = text.to_owned();
     std::thread::spawn(move || {
         let _ = notify_rust::Notification::new()
-            .appname("gitcraft")
-            .summary("gitcraft")
+            .appname("gitcrafted")
+            .summary("gitcrafted")
             .body(&text)
             .show();
     });

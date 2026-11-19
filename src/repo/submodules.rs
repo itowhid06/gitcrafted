@@ -767,7 +767,7 @@ mod tests {
                 .unwrap_or(false);
             assert!(ok, "git {args:?} failed");
         };
-        let base = std::env::temp_dir().join(format!("gitcraft-sub-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("gitcrafted-sub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (inner, outer) = (base.join("inner"), base.join("outer"));
         for d in [&inner, &outer] {

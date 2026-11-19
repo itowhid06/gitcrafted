@@ -45,7 +45,7 @@ pub fn highlight<'a>(
     if syntax.name == "Plain Text" {
         return None;
     }
-    // VS Code's theme when it suits the background: a dark theme on a light gitcraft reads badly.
+    // VS Code's theme when it suits the background: a dark theme on a light gitcrafted reads badly.
     let editor = crate::vscode_theme::enabled()
         .then(crate::vscode_theme::current)
         .flatten()

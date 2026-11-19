@@ -3,14 +3,15 @@
 
 use std::sync::atomic::Ordering;
 
-use gitcraft::app;
+use gitcrafted::{APP_ID, app};
 
 fn main() -> eframe::Result {
+    gitcrafted::prepare();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("GitCraft")
-            // Matches gitcraft.desktop, so Linux desktops show its icon and group its windows.
-            .with_app_id("gitcraft")
+            .with_title("gitcrafted")
+            // Matches gitcrafted.desktop, so Linux desktops show its icon and group its windows.
+            .with_app_id(APP_ID)
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([800.0, 500.0])
             .with_icon(app::window_icon()),
@@ -26,7 +27,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "gitcraft",
+        APP_ID,
         options,
         Box::new(|cc| {
             let open_arg = std::env::args_os().nth(1).map(std::path::PathBuf::from);

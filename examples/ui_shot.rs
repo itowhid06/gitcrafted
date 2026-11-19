@@ -1,7 +1,7 @@
-//! Headless screenshots of gitcraft driven by a small script, for checking the UI without a
+//! Headless screenshots of gitcrafted driven by a small script, for checking the UI without a
 //! window (and without touching the real mouse).
 //!
-//! `cargo run --example ui_shot -- <repo> <out-prefix> [step]...`
+//! `cargo run --example ui_shot -- <repo> <out-prefix> [step]...` (`-` as the repository: the start page)
 //!
 //! Steps (coordinates in points, window is 1400×860):
 //! `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `drag:x1,y1,x2,y2`, `press:x,y` / `move:x,y` / `release:x,y` (a drag in parts), `leave` (pointer off the window), `open:path` (a repository in a new tab), `key:Escape`, `ckey:P` (Ctrl/Cmd+key), `type:text`, `wait:ms`, `shot`.
@@ -26,7 +26,7 @@ fn main() {
         .with_size([1400.0, 860.0])
         // A frame's worth of time per step, so two clicks make a double-click.
         .with_step_dt(1.0 / 60.0)
-        .build_eframe(|cc| gitcraft::app::App::new(cc, Some(repo.into())));
+        .build_eframe(|cc| gitcrafted::app::App::new(cc, (repo != "-").then(|| repo.into())));
     settle(&mut harness, 1500);
 
     let mut shots = 0;
@@ -205,7 +205,7 @@ fn main() {
 }
 
 /// Steps frames for `ms` of real time, so background git work can land.
-fn settle(harness: &mut Harness<'_, gitcraft::app::App>, ms: u64) {
+fn settle(harness: &mut Harness<'_, gitcrafted::app::App>, ms: u64) {
     let end = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < end {
         harness.step();

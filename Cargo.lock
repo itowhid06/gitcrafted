@@ -1446,7 +1446,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitcraft"
+name = "gitcrafted"
 version = "0.3.4"
 dependencies = [
  "eframe",

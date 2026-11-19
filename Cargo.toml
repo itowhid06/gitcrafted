@@ -1,12 +1,12 @@
 [package]
-name = "gitcraft"
+name = "gitcrafted"
 version = "0.3.4"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "A small, personal visual git client"
 publish = false
-repository = "https://github.com/Vancete/gitcraft"
+repository = "https://github.com/itowhid06/gitcrafted"
 readme = "README.md"
 
 [dependencies]
@@ -45,32 +45,50 @@ lto = "thin"
 
 # Linux packages, built by the release workflow (`cargo deb`, `cargo generate-rpm`).
 [package.metadata.deb]
-maintainer = "Iván <vancete07@gmail.com>"
+maintainer = "Towhidul I Chowdhury <itowhid06@users.noreply.github.com>"
 section = "devel"
 depends = "$auto, git"
 extended-description = "A visual git client: commit graph with branch pills, diffs, blame, stashes, interactive rebase, conflicts and a built-in terminal. Drives the installed git command line."
 assets = [
-    ["target/release/gitcraft", "usr/bin/", "755"],
-    ["packaging/gitcraft.desktop", "usr/share/applications/", "644"],
-    ["assets/app-icon/gitcraft-256.png", "usr/share/icons/hicolor/256x256/apps/gitcraft.png", "644"],
-    ["README.md", "usr/share/doc/gitcraft/", "644"],
+    ["target/release/gitcrafted", "usr/bin/", "755"],
+    ["packaging/gitcrafted.desktop", "usr/share/applications/", "644"],
+    ["assets/app-icon/hicolor/16x16/apps/gitcrafted.png", "usr/share/icons/hicolor/16x16/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/22x22/apps/gitcrafted.png", "usr/share/icons/hicolor/22x22/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/24x24/apps/gitcrafted.png", "usr/share/icons/hicolor/24x24/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/32x32/apps/gitcrafted.png", "usr/share/icons/hicolor/32x32/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/48x48/apps/gitcrafted.png", "usr/share/icons/hicolor/48x48/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/64x64/apps/gitcrafted.png", "usr/share/icons/hicolor/64x64/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/128x128/apps/gitcrafted.png", "usr/share/icons/hicolor/128x128/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/256x256/apps/gitcrafted.png", "usr/share/icons/hicolor/256x256/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/512x512/apps/gitcrafted.png", "usr/share/icons/hicolor/512x512/apps/gitcrafted.png", "644"],
+    ["assets/app-icon/hicolor/scalable/apps/gitcrafted.svg", "usr/share/icons/hicolor/scalable/apps/gitcrafted.svg", "644"],
+    ["README.md", "usr/share/doc/gitcrafted/", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/gitcraft", dest = "/usr/bin/gitcraft", mode = "755" },
-    { source = "packaging/gitcraft.desktop", dest = "/usr/share/applications/gitcraft.desktop", mode = "644" },
-    { source = "assets/app-icon/gitcraft-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/gitcraft.png", mode = "644" },
-    { source = "README.md", dest = "/usr/share/doc/gitcraft/README.md", mode = "644", doc = true },
-    { source = "LICENSE-MIT", dest = "/usr/share/licenses/gitcraft/LICENSE-MIT", mode = "644", doc = true },
-    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/gitcraft/LICENSE-APACHE", mode = "644", doc = true },
+    { source = "target/release/gitcrafted", dest = "/usr/bin/gitcrafted", mode = "755" },
+    { source = "packaging/gitcrafted.desktop", dest = "/usr/share/applications/gitcrafted.desktop", mode = "644" },
+    { source = "assets/app-icon/hicolor/16x16/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/16x16/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/22x22/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/22x22/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/24x24/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/24x24/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/32x32/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/32x32/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/48x48/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/48x48/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/64x64/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/64x64/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/128x128/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/128x128/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/256x256/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/256x256/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/512x512/apps/gitcrafted.png", dest = "/usr/share/icons/hicolor/512x512/apps/gitcrafted.png", mode = "644" },
+    { source = "assets/app-icon/hicolor/scalable/apps/gitcrafted.svg", dest = "/usr/share/icons/hicolor/scalable/apps/gitcrafted.svg", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/gitcrafted/README.md", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/gitcrafted/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/gitcrafted/LICENSE-APACHE", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]
 git = "*"
 
 [build-dependencies]
-# Icon and version info for gitcraft.exe; build.rs only uses it when targeting Windows.
+# Icon and version info for gitcrafted.exe; build.rs only uses it when targeting Windows.
 winresource = "0.1"
 
 [dev-dependencies]

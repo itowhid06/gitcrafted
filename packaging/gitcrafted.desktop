@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=gitcrafted
+GenericName=Git client
+Comment=A visual git client
+Exec=gitcrafted %f
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=git;vcs;version control;repository;commit;branch;merge;diff;
+Icon=gitcrafted
+StartupWMClass=gitcrafted

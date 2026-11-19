@@ -1,5 +1,5 @@
 //! Thin wrapper over the `git` command line. Every call shells out to the installed git, so
-//! gitcraft behaves exactly like the user's own git (config, credentials, hooks).
+//! gitcrafted behaves exactly like the user's own git (config, credentials, hooks).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,7 +57,7 @@ pub fn run_ok_codes(dir: Option<&Path>, args: &[&str], ok: &[i32]) -> Result<Str
     run_inner(dir, args, ok, None)
 }
 
-/// A username and password (or token) for an HTTPS remote, typed into gitcraft.
+/// A username and password (or token) for an HTTPS remote, typed into gitcrafted.
 #[derive(Clone)]
 pub struct Credentials {
     pub username: String,
@@ -67,7 +67,7 @@ pub struct Credentials {
 /// A credential helper that answers git's `get` from the environment, so the secret never shows
 /// up in a command line. git tries the user's own helpers first and, when the operation works,
 /// asks them to store what this one gave.
-const ENV_HELPER: &str = "credential.helper=!f() { test \"$1\" = get && echo \"username=$GITCRAFT_GIT_USERNAME\" && echo \"password=$GITCRAFT_GIT_PASSWORD\"; }; f";
+const ENV_HELPER: &str = "credential.helper=!f() { test \"$1\" = get && echo \"username=$GITCRAFTED_GIT_USERNAME\" && echo \"password=$GITCRAFTED_GIT_PASSWORD\"; }; f";
 
 /// [`run`], answering a credential request with `creds` when given.
 pub fn run_with(
@@ -107,8 +107,8 @@ fn run_inner(
     }
     if let Some(c) = creds {
         cmd.args(["-c", ENV_HELPER]);
-        cmd.env("GITCRAFT_GIT_USERNAME", &c.username);
-        cmd.env("GITCRAFT_GIT_PASSWORD", &c.password);
+        cmd.env("GITCRAFTED_GIT_USERNAME", &c.username);
+        cmd.env("GITCRAFTED_GIT_PASSWORD", &c.password);
     }
     cmd.args(args);
     let out = cmd
@@ -588,7 +588,7 @@ pub fn count_apart(repo: &Path, a: &str, b: &str) -> Result<(u32, u32), String> 
 pub fn save_patch(patch: &str) -> Result<PathBuf, String> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join("gitcraft-patches");
+    let dir = std::env::temp_dir().join("gitcrafted-patches");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -1398,7 +1398,7 @@ second.
     /// Two stashes made in the same minute keep names of their own, and each knows its commit.
     #[test]
     fn stashes_are_named_by_number() {
-        let dir = std::env::temp_dir().join(format!("gitcraft-stashes-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gitcrafted-stashes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let git = |args: &[&str]| run(Some(&dir), args);

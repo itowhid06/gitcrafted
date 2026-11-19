@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>gitcrafted</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#2b3c8c"/>
+      <stop offset="1" stop-color="#0d1438"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="104" fill="url(#bg)"/>
+  <g fill="none" stroke-width="52" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M170 120V392" stroke="#6fb4ff"/>
+    <path d="M170 336C170 266 340 294 340 170" stroke="#ffa65c"/>
+  </g>
+  <circle cx="170" cy="392" r="60" fill="#8fc6ff"/>
+  <circle cx="170" cy="120" r="60" fill="#b6a1ff"/>
+  <circle cx="340" cy="152" r="60" fill="#ffc27d"/>
+  <path d="M388 322Q398 384 462 394Q398 404 388 466Q378 404 314 394Q378 384 388 322Z" fill="#ffd36a"/>
+</svg>

@@ -161,7 +161,7 @@ impl RepoTab {
         }
     }
 
-    /// The diff or merge tool git is configured with, when gitcraft can start it; otherwise
+    /// The diff or merge tool git is configured with, when gitcrafted can start it; otherwise
     /// says why not.
     fn usable_tool(&mut self, key: &str, what: &str) -> Option<String> {
         let tool = git::run(Some(&self.path), &["config", "--get", key])
@@ -458,7 +458,7 @@ mod tests {
         }
         f.tab.ext_action(
             ExtAction::Spawn {
-                program: "definitely-not-a-program-gitcraft".to_owned(),
+                program: "definitely-not-a-program-gitcrafted".to_owned(),
                 args: vec![],
                 dir: None,
             },

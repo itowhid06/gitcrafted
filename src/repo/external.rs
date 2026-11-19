@@ -41,7 +41,7 @@ const APPS: &[(&str, &str)] = &[
     ("GNOME Builder", "gnome-builder"),
 ];
 
-/// Tools that need a terminal: gitcraft starts tools without one, where they'd hang unseen.
+/// Tools that need a terminal: gitcrafted starts tools without one, where they'd hang unseen.
 pub fn needs_terminal(tool: &str) -> bool {
     let base = tool.trim_end_matches(['1', '2', '3']);
     matches!(
@@ -224,7 +224,7 @@ mod tests {
     fn a_program_on_the_path_is_found() {
         // `git` runs these tests, so it is on the PATH.
         assert!(on_path("git"));
-        assert!(!on_path("definitely-not-a-program-gitcraft"));
+        assert!(!on_path("definitely-not-a-program-gitcrafted"));
     }
 }
 

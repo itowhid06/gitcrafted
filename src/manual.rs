@@ -1,4 +1,4 @@
-//! The manual (F1, or the book in the title bar): what gitcraft does and its keyboard shortcuts.
+//! The manual (F1, or the book in the title bar): what gitcrafted does and its keyboard shortcuts.
 
 use egui::{RichText, Ui};
 
@@ -49,8 +49,45 @@ const FEATURES: &[(&str, &[&str])] = &[
             "In a file's diff, stage, unstage or discard one hunk, or click the lines you want and act on only those.",
             "A diff shows only the changes or the whole file, unified or side by side, and remembers both. Drag over its lines to select text and Ctrl+C to copy it; the strip by the scrollbar marks where the changes are.",
             "Write the summary and description and commit; amend the last commit; pick the identity you commit as.",
-            "Double-click a commit's message in the right pane to edit it (any commit of the checked-out branch with no merges after it).",
+            "Double-click a commit's message in the right pane, or right-click the commit and choose Edit message…, to edit it (any commit of the checked-out branch with no merges after it).",
+            "Commit & Push, next to the commit button, commits and then pushes the branch.",
             "Undo and redo commits, merges, rebases, resets, checkouts, branches, tags and stashes.",
+        ],
+    ),
+    (
+        "Fetch, pull, push, merge and stash",
+        &[
+            "Each opens a small dialog with its options instead of acting at once.",
+            "Fetch: one remote or all, prune deleted branches, skip tags, force. Pull: remote and branch, then fast-forward only, merge or rebase, with an optional auto-stash.",
+            "Push: branch, remote and remote branch, set upstream, push tags, check submodules, and force push. Force uses a lease: git refuses when the remote has commits you haven't looked at.",
+            "Merge: fast-forward when possible, always a merge commit, or fast-forward only; squash; don't commit yet; a message.",
+            "Stash: a message, untracked files, keep the staged changes, or only the files you Ctrl+clicked in the Changes lists.",
+            "A checkout that local changes block offers to stash them, switch and bring them back.",
+        ],
+    ),
+    (
+        "Submodules",
+        &[
+            "Listed under the worktrees with their branch or commit, how far ahead or behind they are, and a dot when they moved or have changes.",
+            "Double-click one to open it in its own tab. Right-click to initialize, update (to the recorded commit or the latest remote one), fetch or deinitialize it.",
+            "Before an update would leave commits that are on no branch behind, you are asked first. The + adds a submodule.",
+        ],
+    ),
+    (
+        "Patches",
+        &[
+            "Ctrl+click files in the Changes lists to pick several, then right-click to save the picked (or all) staged or unstaged changes as a patch file.",
+            "A stash's menu and a commit's menu save them as patches too.",
+            "The icon in the Changes header applies a patch file: whitespace handling, stage it, three-way merge, or in reverse.",
+        ],
+    ),
+    (
+        "Tools menu",
+        &[
+            "The wrench in the toolbar: Reflog to find a lost commit again, Bisect, Git LFS, Maintenance and Clean untracked files.",
+            "Bisect shows a bar under the toolbar with Good, Bad, Skip and Stop; start it there or from a commit's menu.",
+            "Open the repository in an editor or IDE found on your PATH, and choose the diff and merge tools used by Open in external diff tool.",
+            "Issue links turns #123 (and ABC-123 or your own prefix) in a commit message into links to your tracker.",
         ],
     ),
     (
@@ -95,6 +132,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Click / Shift+click",
                 "Pick lines in a diff, or a range of them",
             ),
+            ("Cmd+click a file", "Pick it for a patch or a partial stash"),
             ("Cmd+Z", "Undo"),
             ("Cmd+Y / Cmd+Shift+Z", "Redo"),
         ],

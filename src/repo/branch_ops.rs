@@ -295,7 +295,7 @@ fn switch_with_changes(target: &str) -> Action {
                 "push".into(),
                 "--include-untracked".into(),
                 "-m".into(),
-                format!("gitcraft: before switching to {target}"),
+                format!("gitcrafted: before switching to {target}"),
             ],
             vec!["checkout".into(), target.to_owned()],
             vec!["stash".into(), "pop".into(), "--index".into()],
@@ -442,7 +442,7 @@ mod tests {
                 &args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
             )
         };
-        let base = std::env::temp_dir().join(format!("gitcraft-merge-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("gitcrafted-merge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).ok();
         assert!(g(&base, &["init", "-q", "-b", "main"]));

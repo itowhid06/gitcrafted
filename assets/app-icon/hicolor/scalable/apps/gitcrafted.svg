@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>gitcrafted</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#26357a"/>
+      <stop offset="1" stop-color="#0b1130"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.28" cy="0.18" r="0.75">
+      <stop offset="0" stop-color="#5b8cff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#5b8cff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="trunk" gradientUnits="userSpaceOnUse" x1="0" y1="120" x2="0" y2="392">
+      <stop offset="0" stop-color="#9ad5ff"/>
+      <stop offset="1" stop-color="#3d86ff"/>
+    </linearGradient>
+    <linearGradient id="branch" gradientUnits="userSpaceOnUse" x1="0" y1="152" x2="0" y2="336">
+      <stop offset="0" stop-color="#ffd27a"/>
+      <stop offset="1" stop-color="#ff6b5b"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff0b0"/>
+      <stop offset="1" stop-color="#ffc83d"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="112" fill="url(#glow)"/>
+  <g fill="none" stroke-width="42" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M170 120V392" stroke="url(#trunk)"/>
+    <path d="M170 336C170 266 340 294 340 152" stroke="url(#branch)"/>
+  </g>
+  <g stroke-width="26" fill="#0b1130">
+    <circle cx="170" cy="392" r="46" stroke="#6fb4ff"/>
+    <circle cx="170" cy="120" r="46" stroke="#a78bff"/>
+    <circle cx="340" cy="152" r="46" stroke="#ffb15c"/>
+  </g>
+  <path d="M388 318Q399 383 466 394Q399 405 388 470Q377 405 310 394Q377 383 388 318Z" fill="url(#spark)"/>
+  <path d="M440 300Q442 318 460 320Q442 322 440 340Q438 322 420 320Q438 318 440 300Z" fill="#ffd36a" opacity="0.85"/>
+</svg>

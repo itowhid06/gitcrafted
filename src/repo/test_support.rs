@@ -23,7 +23,7 @@ fn sweep_old() {
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age > Duration::from_secs(600));
-            if name.starts_with("gitcraft-t-") && !name.ends_with(&own) && old {
+            if name.starts_with("gitcrafted-t-") && !name.ends_with(&own) && old {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
@@ -33,7 +33,7 @@ fn sweep_old() {
 /// An empty, unique folder for one test.
 pub fn scratch(name: &str) -> PathBuf {
     sweep_old();
-    let dir = std::env::temp_dir().join(format!("gitcraft-t-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("gitcrafted-t-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     dir

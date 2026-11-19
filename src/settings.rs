@@ -71,7 +71,7 @@ impl Default for Settings {
 }
 
 fn id() -> egui::Id {
-    egui::Id::new("gitcraft-settings")
+    egui::Id::new("gitcrafted-settings")
 }
 
 impl Settings {
@@ -126,7 +126,7 @@ impl Settings {
                     let note = match crate::vscode_theme::current() {
                         Some(found) if found.dark == t.dark() => found.name.clone(),
                         Some(found) => format!(
-                            "{} is {}: gitcraft's colours meanwhile",
+                            "{} is {}: gitcrafted's colours meanwhile",
                             found.name,
                             if found.dark { "dark" } else { "light" }
                         ),
@@ -139,18 +139,22 @@ impl Settings {
             ui.label("Notifications");
             ui.checkbox(&mut self.notifications, "When a long operation ends in the background");
             ui.end_row();
-            if let Some(appimage) = crate::desktop_entry::appimage() {
+            if let Some(exe) = crate::desktop_entry::target() {
                 ui.label("Applications menu");
                 ui.horizontal(|ui| {
                     if crate::desktop_entry::installed() {
-                        if ui.button("Remove gitcraft").clicked() {
+                        if ui.button("Remove gitcrafted").clicked() {
                             let _ = crate::desktop_entry::uninstall();
                         }
-                    } else if ui.button("Add gitcraft").clicked() {
-                        let _ = crate::desktop_entry::install(&appimage);
+                    } else if ui.button("Add gitcrafted").clicked() {
+                        let _ = crate::desktop_entry::install(&exe);
                     }
                     ui.label(
-                        RichText::new("Starts this AppImage; follows it when you replace it")
+                        RichText::new(if crate::desktop_entry::is_appimage() {
+                            "Starts this AppImage; follows it when you replace it"
+                        } else {
+                            "Shows the icon and name in the dock and top bar; follows this program"
+                        })
                             .color(t.text_faint)
                             .small(),
                     );

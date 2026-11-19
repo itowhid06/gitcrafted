@@ -1,5 +1,5 @@
 //! Pull requests through the forges' own command-line tools: `gh` for GitHub, `glab` for
-//! GitLab. They hold the user's login, so gitcraft never stores a token.
+//! GitLab. They hold the user's login, so gitcrafted never stores a token.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -69,7 +69,7 @@ fn tool(forge: Forge, repo: &Path, args: &[&str]) -> Result<String, String> {
     }
     let out = cmd.output().map_err(|_| {
         format!(
-            "{} isn't installed: gitcraft uses it for {}s",
+            "{} isn't installed: gitcrafted uses it for {}s",
             forge.tool(),
             forge.noun()
         )
@@ -211,7 +211,7 @@ pub fn github_avatars(repo: &Path, host: &str, path: &str) -> HashMap<String, St
         }
         ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(10))
-            .user_agent("gitcraft")
+            .user_agent("gitcrafted")
             .build()
             .get(&format!("https://api.github.com/{endpoint}"))
             .call()

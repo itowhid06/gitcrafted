@@ -551,7 +551,7 @@ mod tests {
     /// A repository with a modified, a staged, a new tracked and an untracked file, and a stash.
     #[test]
     fn saves_staged_unstaged_and_stash_patches_that_apply_back() {
-        let base = std::env::temp_dir().join(format!("gitcraft-patch-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("gitcrafted-patch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (repo, copy) = (base.join("repo"), base.join("copy"));
         std::fs::create_dir_all(&repo).ok();

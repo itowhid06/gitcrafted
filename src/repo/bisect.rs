@@ -98,7 +98,7 @@ fn mark(label: &str, verb: &str, rev: Option<&str>) -> Action {
 
 impl RepoTab {
     fn bisect_log_path(&self, ctx: &egui::Context) -> Option<std::path::PathBuf> {
-        let id = egui::Id::new(("gitcraft-bisect-log", &self.path));
+        let id = egui::Id::new(("gitcrafted-bisect-log", &self.path));
         if let Some(p) = ctx.data(|d| d.get_temp::<Option<std::path::PathBuf>>(id)) {
             return p;
         }
@@ -115,7 +115,7 @@ impl RepoTab {
     }
 
     fn bisect_info(&self, ctx: &egui::Context) -> Info {
-        let id = egui::Id::new(("gitcraft-bisect-info", &self.path));
+        let id = egui::Id::new(("gitcrafted-bisect-info", &self.path));
         let stamp = self
             .bisect_log_path(ctx)
             .and_then(|p| p.metadata().and_then(|m| m.modified()).ok());
@@ -329,7 +329,7 @@ mod tests {
     /// Against real git: start, mark, find the culprit, stop; the bar's data follows along.
     #[test]
     fn bisect_finds_the_first_bad_commit() {
-        let dir = std::env::temp_dir().join(format!("gitcraft-bisect-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gitcrafted-bisect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok();
         let run = |args: &[&str]| {

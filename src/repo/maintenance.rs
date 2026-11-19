@@ -437,7 +437,7 @@ mod tests {
     /// Against real git: the preview lists what `clean -f` then removes.
     #[test]
     fn clean_removes_what_the_preview_listed() {
-        let dir = std::env::temp_dir().join(format!("gitcraft-clean-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gitcrafted-clean-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("build")).ok();
         let run = |args: &[&str]| git::run(Some(&dir), args);

@@ -1,5 +1,5 @@
 //! Issue links: `#123`, `ABC-123` or `PROJ-123` in commit messages become links to the issue
-//! tracker. Rules are kept in the repository's git config (`gitcraft.issuelink`, one per value);
+//! tracker. Rules are kept in the repository's git config (`gitcrafted.issuelink`, one per value);
 //! without any, GitHub and GitLab remotes link `#123` to their issues.
 
 use std::ops::Range;
@@ -15,7 +15,7 @@ use super::{Action, Dialog, RepoTab};
 use crate::git;
 use crate::theme::Tokens;
 
-const KEY: &str = "gitcraft.issuelink";
+const KEY: &str = "gitcrafted.issuelink";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -221,7 +221,7 @@ pub fn write_rules(repo: &std::path::Path, rules: &[Rule]) {
 
 impl RepoTab {
     fn issue_cache_id(&self) -> egui::Id {
-        egui::Id::new(("gitcraft-issue-rules", &self.path))
+        egui::Id::new(("gitcrafted-issue-rules", &self.path))
     }
 
     /// The tab's issue rules (read from git config once, then remembered).
@@ -548,7 +548,7 @@ mod flow_tests {
         vec![
             Rule {
                 kind: Kind::Hash,
-                url: "https://t.example/issues?id={id}&src=gitcraft".to_owned(),
+                url: "https://t.example/issues?id={id}&src=gitcrafted".to_owned(),
             },
             Rule {
                 kind: Kind::Jira,
@@ -650,7 +650,7 @@ mod flow_tests {
             urls,
             [
                 "https://p.example/77",
-                "https://t.example/issues?id=12&src=gitcraft",
+                "https://t.example/issues?id=12&src=gitcrafted",
                 "https://j.example/browse/ABC-9"
             ]
         );

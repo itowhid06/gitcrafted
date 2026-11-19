@@ -1,4 +1,4 @@
-# Builds gitcraft for Windows, Linux and macOS and publishes a GitHub release when a `v*` tag is pushed.
+# Builds gitcrafted for Windows, Linux and macOS and publishes a GitHub release when a `v*` tag is pushed.
 # Run it by hand (Actions › Release › Run workflow) to only build and download the artifacts.
 name: Release
 
@@ -56,26 +56,26 @@ jobs:
       - name: App, dmg and zip (macOS)
         if: runner.os == 'macOS'
         run: |
-          name="gitcraft-${{ github.ref_name }}-${{ matrix.name }}"
+          name="gitcrafted-${{ github.ref_name }}-${{ matrix.name }}"
           version="$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)"
           sh packaging/macos/build-app.sh "$version" "$name"
           # Both architectures, signed, and the disk image is sound.
           mkdir check
           ditto -x -k "$name.zip" check
-          lipo -archs check/gitcraft.app/Contents/MacOS/gitcraft
-          lipo -archs check/gitcraft.app/Contents/MacOS/gitcraft | grep -q x86_64
-          lipo -archs check/gitcraft.app/Contents/MacOS/gitcraft | grep -q arm64
-          codesign --verify --strict check/gitcraft.app
-          plutil -lint check/gitcraft.app/Contents/Info.plist
+          lipo -archs check/gitcrafted.app/Contents/MacOS/gitcrafted
+          lipo -archs check/gitcrafted.app/Contents/MacOS/gitcrafted | grep -q x86_64
+          lipo -archs check/gitcrafted.app/Contents/MacOS/gitcrafted | grep -q arm64
+          codesign --verify --strict check/gitcrafted.app
+          plutil -lint check/gitcrafted.app/Contents/Info.plist
           hdiutil verify "$name.dmg"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dir = "gitcraft-${{ github.ref_name }}-${{ matrix.name }}"
+          $dir = "gitcrafted-${{ github.ref_name }}-${{ matrix.name }}"
           New-Item -ItemType Directory $dir | Out-Null
-          Copy-Item target/release/gitcraft.exe, README.md, ATTRIBUTION.md, LICENSE-MIT, LICENSE-APACHE $dir
+          Copy-Item target/release/gitcrafted.exe, README.md, ATTRIBUTION.md, LICENSE-MIT, LICENSE-APACHE $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
       - name: Installer (Windows)
@@ -84,19 +84,19 @@ jobs:
         run: |
           choco install innosetup --no-progress -y
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp "/DAppVersion=$version" "/DOutputName=gitcraft-${{ github.ref_name }}-${{ matrix.name }}-setup" packaging\windows\gitcraft.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp "/DAppVersion=$version" "/DOutputName=gitcrafted-${{ github.ref_name }}-${{ matrix.name }}-setup" packaging\windows\gitcrafted.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Move-Item dist\*.exe .
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
-          dir="gitcraft-${{ github.ref_name }}-${{ matrix.name }}"
+          dir="gitcrafted-${{ github.ref_name }}-${{ matrix.name }}"
           mkdir "$dir"
-          cp target/release/gitcraft README.md ATTRIBUTION.md LICENSE-MIT LICENSE-APACHE \
-            packaging/gitcraft.desktop "$dir/"
-          cp assets/app-icon/gitcraft-256.png "$dir/gitcraft.png"
-          strip "$dir/gitcraft"
+          cp target/release/gitcrafted README.md ATTRIBUTION.md LICENSE-MIT LICENSE-APACHE \
+            packaging/gitcrafted.desktop "$dir/"
+          cp assets/app-icon/gitcrafted-256.png "$dir/gitcrafted.png"
+          strip "$dir/gitcrafted"
           tar czf "$dir.tar.gz" "$dir"
 
       - name: AppImage (Linux)
@@ -108,7 +108,7 @@ jobs:
           sudo curl -fsSL -o /usr/local/bin/appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           sudo chmod +x /usr/local/bin/appimagetool
-          sh packaging/linux/build-appimage.sh "gitcraft-${{ github.ref_name }}-${{ matrix.name }}.AppImage"
+          sh packaging/linux/build-appimage.sh "gitcrafted-${{ github.ref_name }}-${{ matrix.name }}.AppImage"
 
       - uses: taiki-e/install-action@v2
         if: runner.os == 'Linux'
@@ -118,29 +118,35 @@ jobs:
       - name: deb and rpm (Linux)
         if: runner.os == 'Linux'
         run: |
-          name="gitcraft-${{ github.ref_name }}-${{ matrix.name }}"
-          strip target/release/gitcraft
+          name="gitcrafted-${{ github.ref_name }}-${{ matrix.name }}"
+          strip target/release/gitcrafted
           cargo deb --no-build --output "$name.deb"
           cargo generate-rpm --output "$name.rpm"
           # The .deb installs, with its menu entry and icon; the .rpm holds the same files.
           sudo apt-get install -y desktop-file-utils rpm "./$name.deb"
-          desktop-file-validate /usr/share/applications/gitcraft.desktop
-          test -x /usr/bin/gitcraft
-          test -f /usr/share/icons/hicolor/256x256/apps/gitcraft.png
+          desktop-file-validate /usr/share/applications/gitcrafted.desktop
+          test -x /usr/bin/gitcrafted
+          for size in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+            test -f "/usr/share/icons/hicolor/$size/apps/gitcrafted.png"
+          done
+          test -f /usr/share/icons/hicolor/scalable/apps/gitcrafted.svg
           rpm -qp --requires "$name.rpm"
           rpm -qlp "$name.rpm"
+          for size in 16x16 512x512 scalable; do
+            rpm -qlp "$name.rpm" | grep -q "/usr/share/icons/hicolor/$size/apps/gitcrafted\."
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gitcraft-${{ matrix.name }}
+          name: gitcrafted-${{ matrix.name }}
           path: |
-            gitcraft-*.zip
-            gitcraft-*.dmg
-            gitcraft-*.tar.gz
-            gitcraft-*-setup.exe
-            gitcraft-*.AppImage
-            gitcraft-*.deb
-            gitcraft-*.rpm
+            gitcrafted-*.zip
+            gitcrafted-*.dmg
+            gitcrafted-*.tar.gz
+            gitcrafted-*-setup.exe
+            gitcrafted-*.AppImage
+            gitcrafted-*.deb
+            gitcrafted-*.rpm
 
   release:
     needs: build

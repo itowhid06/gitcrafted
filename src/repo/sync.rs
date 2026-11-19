@@ -525,7 +525,7 @@ impl Push {
             if self.no_lease {
                 args.push("--force".into());
             } else {
-                // The lease alone is void once a fetch (gitcraft fetches in the background) has
+                // The lease alone is void once a fetch (gitcrafted fetches in the background) has
                 // updated the remote-tracking branch; `--force-if-includes` also asks that what
                 // was fetched is part of the branch being pushed.
                 args.push("--force-with-lease".into());
@@ -615,7 +615,7 @@ mod tests {
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         };
-        let base = std::env::temp_dir().join(format!("gitcraft-pull-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("gitcrafted-pull-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).ok();
         let (a, b) = (base.join("a"), base.join("b"));
@@ -1000,7 +1000,7 @@ mod safety_tests {
     #[test]
     fn a_background_fetch_does_not_turn_the_lease_into_a_plain_force() {
         let (work, bare) = raced("sf-lease-fetch");
-        git(&work, &["fetch", "-q"]); // what gitcraft's background fetch does
+        git(&work, &["fetch", "-q"]); // what gitcrafted's background fetch does
         git(&work, &["commit", "-q", "--amend", "-m", "mine, amended"]);
         let mut f = Fixture::open(&work);
         let mut d = push_dialog(&f);

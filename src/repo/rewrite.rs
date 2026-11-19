@@ -199,7 +199,7 @@ mod tests {
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         };
-        let base = std::env::temp_dir().join(format!("gitcraft-force-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("gitcrafted-force-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (remote, a, b) = (base.join("remote.git"), base.join("a"), base.join("b"));
         std::fs::create_dir_all(&base).ok();

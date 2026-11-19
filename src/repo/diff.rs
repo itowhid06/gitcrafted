@@ -1624,7 +1624,7 @@ mod tests {
     /// Stages, unstages and discards a few lines in a real repository.
     fn partial_patches_apply(whole_file: bool) {
         let dir = std::env::temp_dir().join(format!(
-            "gitcraft-partial-{}-{whole_file}",
+            "gitcrafted-partial-{}-{whole_file}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
