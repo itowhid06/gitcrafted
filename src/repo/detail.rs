@@ -405,7 +405,11 @@ impl RepoTab {
     fn changes_panel(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let t = Tokens::get(ui.ctx());
         let idle = self.busy_op.is_none();
-        widgets::panel_header(ui, "Changes", |_| {});
+        widgets::panel_header(ui, "Changes", |ui| {
+            if icons::small_button(ui, "file-diff", "Apply a patch…").clicked() && idle {
+                acts.push(Action::Dialog(Dialog::apply_patch(&self.path)));
+            }
+        });
 
         // The commit box stays at the bottom.
         egui::Panel::bottom("commit_box")
@@ -537,7 +541,7 @@ impl RepoTab {
         buttons: &[(&str, &str)],
     ) -> RowClick {
         let key = DiffKey::Work(f.clone());
-        let selected = self.open_key() == Some(&key);
+        let selected = self.open_key() == Some(&key) || self.patch_selected(f);
         let buttons = if self.busy_op.is_none() { buttons } else { &[] };
         let r = widgets::file_row(
             ui,
@@ -548,10 +552,22 @@ impl RepoTab {
             RowExtra::Buttons(buttons),
         );
         if f.code != 'D' {
-            widgets::file_menu(&r.row, &f.path, None, true, acts);
+            widgets::file_menu_with(&r.row, &f.path, None, true, acts, |ui, acts| {
+                self.patch_menu_items(ui, acts, f)
+            });
+        } else {
+            // A deleted file has nothing to open, but its removal can go in a patch.
+            egui::Popup::context_menu(&r.row)
+                .style(crate::theme::menu_style)
+                .show(|ui| self.patch_menu_items(ui, acts, f));
         }
         match r.button {
             Some(i) => RowClick::Button(i),
+            // Ctrl+click picks files for a patch instead of opening the diff.
+            None if r.row.clicked() && ui.input(|i| i.modifiers.command) => {
+                acts.push(Action::Patch(super::patch::PatchAction::Toggle(f.clone())));
+                RowClick::None
+            }
             None if r.row.clicked() => RowClick::Open,
             None => RowClick::None,
         }

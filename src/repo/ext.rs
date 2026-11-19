@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use egui::Ui;
 
 use super::dialogs::Outcome;
-use super::{Dialog, RepoTab};
+use super::{Action, Dialog, RepoTab, WIP_HASH};
 use crate::git;
 use crate::theme::Tokens;
 
@@ -31,6 +31,10 @@ pub enum ExtAction {
         args: Vec<String>,
         dir: Option<PathBuf>,
     },
+    /// A file's changes in the diff tool git is configured with.
+    DiffTool { path: String, staged: bool },
+    /// A conflicted file in the merge tool git is configured with.
+    MergeTool { path: String },
 }
 
 impl RepoTab {
@@ -41,9 +45,112 @@ impl RepoTab {
                     self.status = Some((e, true));
                 }
             }
+            ExtAction::DiffTool { path, staged } => {
+                if self.usable_tool("diff.tool", "diff").is_some() {
+                    let mut args = vec!["difftool".to_owned(), "-y".to_owned()];
+                    if staged {
+                        args.push("--cached".into());
+                    }
+                    args.extend(["--".to_owned(), literal(&path)]);
+                    self.spawn_git(ctx, args);
+                }
+            }
+            ExtAction::MergeTool { path } => {
+                if self.usable_tool("merge.tool", "merge").is_some() {
+                    self.spawn_git(
+                        ctx,
+                        vec![
+                            "mergetool".to_owned(),
+                            "-y".to_owned(),
+                            "--".to_owned(),
+                            literal(&path),
+                        ],
+                    );
+                }
+            }
         }
     }
 
+    /// The diff or merge tool git is configured with, when gitcraft can start it; otherwise
+    /// says why not.
+    fn usable_tool(&mut self, key: &str, what: &str) -> Option<String> {
+        let tool = git::run(Some(&self.path), &["config", "--get", key])
+            .map(|v| v.trim().to_owned())
+            .unwrap_or_default();
+        if tool.is_empty() {
+            self.status = Some((
+                format!("No {what} tool is set: choose one in Tools → External tools…"),
+                true,
+            ));
+            return None;
+        }
+        if super::external::needs_terminal(&tool) {
+            self.status = Some((
+                format!(
+                    "{tool} runs in a terminal: use `git {what}tool` in the terminal panel, or choose a graphical tool in Tools → External tools…"
+                ),
+                true,
+            ));
+            return None;
+        }
+        Some(tool)
+    }
+
+    fn spawn_git(&mut self, ctx: &egui::Context, args: Vec<String>) {
+        let mut full = vec!["-C".to_owned(), self.path.display().to_string()];
+        full.extend(args);
+        if let Err(e) = spawn_detached(ctx, "git", &full, None) {
+            self.status = Some((e, true));
+        }
+    }
+
+    /// The entries of the toolbar's Tools menu.
+    pub(super) fn tools_menu(&self, ui: &mut Ui, acts: &mut Vec<Action>) {
+        ui.menu_button("Open repository in", |ui| {
+            let apps = super::external::detected();
+            if apps.is_empty() {
+                ui.label("No editor found on the PATH");
+            }
+            for app in apps {
+                if ui.button(&app.label).clicked() {
+                    acts.push(Action::Ext(ExtAction::Spawn {
+                        program: app.program.clone(),
+                        args: vec![self.path.display().to_string()],
+                        dir: None,
+                    }));
+                    ui.close();
+                }
+            }
+        });
+        if ui.button("External diff and merge tools…").clicked() {
+            acts.push(Action::Dialog(self.external_tools_dialog()));
+        }
+    }
+
+    /// The extra entries of a commit's right-click menu.
+    pub(super) fn commit_menu_extras(
+        &self,
+        ui: &mut Ui,
+        acts: &mut Vec<Action>,
+        hash: &str,
+        idle: bool,
+    ) {
+        if hash == WIP_HASH {
+            return;
+        }
+        self.edit_message_item(ui, acts, hash, idle);
+        if ui
+            .button("Save as patch…")
+            .on_hover_text("This commit as a patch file (git format-patch)")
+            .clicked()
+        {
+            acts.push(Action::Patch(super::patch::PatchAction::Save(
+                super::patch::PatchSource::Commit {
+                    hash: hash.to_owned(),
+                },
+            )));
+        }
+    }
 }
 
 /// Starts `program` and returns at once; a thread reaps it and wakes the UI when it ends.

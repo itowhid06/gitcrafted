@@ -305,6 +305,7 @@ impl RepoTab {
                 refresh: Refresh::All,
             });
         }
+        self.force_push_item(ui, acts, b, idle);
         if let Some(forge) = self.forge {
             let existing = self.prs.iter().find(|p| p.branch == b.name);
             match existing {
@@ -791,6 +792,7 @@ pub(super) fn stash_menu_items(ui: &mut Ui, acts: &mut Vec<Action>, name: &str, 
         });
     }
     ui.separator();
+    super::patch::stash_patch_item(ui, acts, name);
     if ui.add_enabled(idle, egui::Button::new("Drop…")).clicked() {
         acts.push(Action::Dialog(Dialog::confirm(
             "Drop stash",

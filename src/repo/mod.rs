@@ -9,7 +9,10 @@ mod file_view;
 mod graph_view;
 mod highlight;
 mod ext;
+mod external;
+mod patch;
 mod rebase;
+mod rewrite;
 mod sidebar;
 #[cfg(test)]
 mod test_support;
@@ -346,6 +349,10 @@ pub(crate) enum Action {
         hash: String,
         message: String,
     },
+    /// Select a commit and open its message editor.
+    EditMessage(String),
+    /// Save a patch, or select files for one.
+    Patch(patch::PatchAction),
     /// The extra features' actions (see `ext.rs`).
     Ext(ext::ExtAction),
     /// A fetch with the given arguments (`git fetch …`), from the Fetch dialog.
@@ -443,6 +450,10 @@ pub struct RepoTab {
     search: Search,
     /// A commit to select once enough history is loaded (search results, links).
     pending_goto: Option<String>,
+    /// A commit whose message editor opens once its details are loaded.
+    pending_edit: Option<String>,
+    /// Files Ctrl+clicked in the Changes lists, to save as a patch.
+    patch_sel: Vec<StatusFile>,
 
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
@@ -532,6 +543,8 @@ impl RepoTab {
             dialog: None,
             search: Search::default(),
             pending_goto: None,
+            pending_edit: None,
+            patch_sel: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             busy_op: None,
@@ -1184,6 +1197,15 @@ impl RepoTab {
             );
             return;
         }
+        // The rebase brings uncommitted changes back unstaged (`--autostash`): a careful partial
+        // staging would be flattened. Ask for it to be committed or unstaged first.
+        if !self.work.staged.is_empty() {
+            self.status = Some((
+                "Rewording an older commit would unstage your staged changes: commit or unstage them first".to_owned(),
+                true,
+            ));
+            return;
+        }
         let path = self.path.clone();
         spawn(&self.tx, ctx, move || {
             let result = git::rebase_commits(&path, &format!("{hash}^"));
@@ -1523,6 +1545,7 @@ impl RepoTab {
                         self.has_more = loaded.history.len() >= loaded.requested;
                         self.history = loaded.history;
                         self.work = loaded.work;
+                        self.prune_patch_selection();
                         self.worktrees = loaded.worktrees;
                         self.submodules = loaded.submodules;
                         // Stash numbers shift when one is pushed or dropped; follow the commit.
@@ -1575,6 +1598,7 @@ impl RepoTab {
             Msg::Status(result) => match result {
                 Ok(work) => {
                     self.work = work;
+                    self.prune_patch_selection();
                     self.rebuild(ctx);
                     if self.compare.as_ref().is_some_and(|c| c.target.is_none()) {
                         self.reload_compare(ctx);
@@ -1587,6 +1611,9 @@ impl RepoTab {
                     match result {
                         Ok(d) => self.detail = Some(d),
                         Err(e) => self.detail_error = Some(e),
+                    }
+                    if self.pending_edit.take().as_deref() == Some(hash.as_str()) {
+                        self.open_message_editor();
                     }
                 }
             }
@@ -1956,6 +1983,8 @@ impl RepoTab {
                 });
             }
             Action::Reword { hash, message } => self.reword_commit(hash, message, ctx),
+            Action::EditMessage(hash) => self.start_edit_message(hash, ctx),
+            Action::Patch(action) => self.patch_action(action, ctx),
             Action::Ext(action) => self.ext_action(action, ctx),
             Action::FetchWith(args) => {
                 self.last_fetch = Instant::now();
@@ -2337,6 +2366,10 @@ impl RepoTab {
                         ui.ctx().copy_text(self.path.display().to_string());
                     }
                 });
+            let tools = icons::tool_button(ui, "wrench", "", true).on_hover_text("Tools");
+            egui::Popup::menu(&tools)
+                .style(crate::theme::menu_style)
+                .show(|ui| self.tools_menu(ui, acts));
             widgets::toolbar_separator(ui);
             if icons::tool_button(ui, "refresh-cw", "", !self.loading)
                 .on_hover_text("Reload (F5)")
@@ -2435,6 +2468,11 @@ impl RepoTab {
             ("Fetch".into(), "remote".into(), Action::Fetch),
             ("Pull".into(), "remote".into(), Action::Pull),
             ("Push".into(), "remote".into(), Action::Push),
+            (
+                "Apply patch…".into(),
+                "patch".into(),
+                Action::Dialog(Dialog::apply_patch(&self.path)),
+            ),
             ("Undo".into(), "Ctrl+Z".into(), Action::Undo),
             ("Redo".into(), "Ctrl+Y".into(), Action::Redo),
             (

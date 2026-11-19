@@ -498,6 +498,18 @@ pub fn file_menu(
     ignorable: bool,
     acts: &mut Vec<super::Action>,
 ) {
+    file_menu_with(resp, path, rev, ignorable, acts, |_, _| {});
+}
+
+/// [`file_menu`] with more entries at the end, from `extra`.
+pub fn file_menu_with(
+    resp: &Response,
+    path: &str,
+    rev: Option<&str>,
+    ignorable: bool,
+    acts: &mut Vec<super::Action>,
+    extra: impl FnOnce(&mut Ui, &mut Vec<super::Action>),
+) {
     use super::Action;
     use super::file_view::FileTab;
     egui::Popup::context_menu(resp)
@@ -546,6 +558,7 @@ pub fn file_menu(
             if ui.button("Copy path").clicked() {
                 ui.ctx().copy_text(path.to_owned());
             }
+            extra(ui, acts);
         });
 }
 

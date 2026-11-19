@@ -69,6 +69,8 @@ pub enum Dialog {
         url: String,
         focus: bool,
     },
+    /// Apply a patch file.
+    Apply(super::patch::ApplyDialog),
     /// A dialog defined in its own file (see `ext.rs`).
     Ext(Box<dyn super::ext::DialogBody>),
     /// Fetch, pull or push, with their options.
@@ -612,6 +614,7 @@ impl RepoTab {
                     })
                 }
                 Dialog::Sync(sync) => sync.ui(ui, &t, enter),
+                Dialog::Apply(apply) => apply.ui(ui, &t, enter),
                 Dialog::Ext(body) => body.ui(ui, &t, enter),
                 Dialog::AddSubmodule { url, path, path_edited, focus } => {
                     title(ui, "Add submodule", "The repository to embed and the folder it goes in.", &t);

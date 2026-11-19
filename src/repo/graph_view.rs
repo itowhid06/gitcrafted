@@ -430,6 +430,7 @@ impl RepoTab {
             });
         }
         ui.separator();
+        self.commit_menu_extras(ui, acts, &hash, idle);
         if ui
             .add_enabled(
                 idle && !is_head,
