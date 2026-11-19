@@ -26,7 +26,7 @@ impl RepoTab {
             icons::inline(ui, "search", 15.0, t.text_faint);
             ui.add(
                 egui::TextEdit::singleline(&mut self.branch_filter)
-                    .hint_text("Filter branches and tags")
+                    .hint_text("Filter branches, tags and submodules")
                     .desired_width(ui.available_width() - 10.0)
                     .margin(egui::Margin::symmetric(8, 4)),
             );
@@ -67,6 +67,7 @@ impl RepoTab {
 
                 self.remotes_section(ui, acts, idle, &filter);
                 self.worktree_section(ui, acts, idle);
+                self.submodule_section(ui, acts, idle, &filter);
                 self.stash_section(ui, acts, idle);
                 self.pr_section(ui, acts, idle);
 

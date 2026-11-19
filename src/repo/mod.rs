@@ -8,8 +8,13 @@ mod diff;
 mod file_view;
 mod graph_view;
 mod highlight;
+mod ext;
 mod rebase;
 mod sidebar;
+#[cfg(test)]
+mod test_support;
+mod sync;
+mod submodules;
 pub(crate) mod widgets;
 
 use std::collections::{HashMap, HashSet};
@@ -79,6 +84,7 @@ struct Loaded {
     history: Vec<Commit>,
     work: WorkStatus,
     worktrees: Vec<Worktree>,
+    submodules: Vec<submodules::Submodule>,
     stashes: Vec<Stash>,
     remotes: Vec<Remote>,
     identity: Identity,
@@ -340,6 +346,10 @@ pub(crate) enum Action {
         hash: String,
         message: String,
     },
+    /// The extra features' actions (see `ext.rs`).
+    Ext(ext::ExtAction),
+    /// A fetch with the given arguments (`git fetch …`), from the Fetch dialog.
+    FetchWith(Vec<String>),
     InteractiveRebase {
         onto: String,
         label: String,
@@ -393,6 +403,7 @@ pub struct RepoTab {
     graph: Graph,
     index: HashMap<String, usize>,
     worktrees: Vec<Worktree>,
+    submodules: Vec<submodules::Submodule>,
     stashes: Vec<Stash>,
     remotes: Vec<Remote>,
     identity: Identity,
@@ -490,6 +501,7 @@ impl RepoTab {
             },
             index: HashMap::new(),
             worktrees: Vec::new(),
+            submodules: Vec::new(),
             stashes: Vec::new(),
             remotes: Vec::new(),
             identity: Identity::default(),
@@ -570,6 +582,7 @@ impl RepoTab {
                 let work = git::status(&path)?;
                 // Very old gits have no `worktree list`; the section just stays empty.
                 let worktrees = git::worktrees(&path).unwrap_or_default();
+                let submodules = submodules::list(&path);
                 let stashes = git::stashes(&path).unwrap_or_default();
                 let remotes = git::remotes(&path).unwrap_or_default();
                 let identity = git::identity(&path);
@@ -578,6 +591,7 @@ impl RepoTab {
                     history,
                     work,
                     worktrees,
+                    submodules,
                     stashes,
                     remotes,
                     identity,
@@ -1510,6 +1524,7 @@ impl RepoTab {
                         self.history = loaded.history;
                         self.work = loaded.work;
                         self.worktrees = loaded.worktrees;
+                        self.submodules = loaded.submodules;
                         // Stash numbers shift when one is pushed or dropped; follow the commit.
                         let viewed = self
                             .stash_view
@@ -1941,6 +1956,11 @@ impl RepoTab {
                 });
             }
             Action::Reword { hash, message } => self.reword_commit(hash, message, ctx),
+            Action::Ext(action) => self.ext_action(action, ctx),
+            Action::FetchWith(args) => {
+                self.last_fetch = Instant::now();
+                self.run_ops("Fetch", vec![args], Refresh::All, plain, ctx)
+            }
             Action::RunRebase => {
                 let Some(editor) = &self.rebase else { return };
                 if editor.problem().is_some() || self.busy_op.is_some() {
@@ -2237,14 +2257,14 @@ impl RepoTab {
 
             let has_remote = !self.remotes.is_empty();
             let fetched = format!(
-                "Fetch all remotes (git fetch --all --prune)\nLast fetched {} ago",
+                "Fetch… (git fetch)\nLast fetched {} ago",
                 short_duration(self.last_fetch.elapsed())
             );
             if icons::tool_button(ui, "cloud-download", "Fetch", idle && has_remote)
                 .on_hover_text(fetched)
                 .clicked()
             {
-                acts.push(Action::Fetch);
+                acts.push(Action::Dialog(self.sync_dialog(sync::SyncKind::Fetch)));
             }
             let (ahead, behind) = self
                 .refs
@@ -2260,16 +2280,16 @@ impl RepoTab {
                 behind,
                 idle && has_remote,
             )
-            .on_hover_text("Fast-forward the current branch (git pull --ff-only)")
+            .on_hover_text("Pull… (merge, rebase or fast-forward the current branch)")
             .clicked()
             {
-                acts.push(Action::Pull);
+                acts.push(Action::Dialog(self.sync_dialog(sync::SyncKind::Pull)));
             }
             if icons::tool_button_count(ui, "arrow-up-from-line", "Push", ahead, idle && has_remote)
-                .on_hover_text("Push the current branch (publishes it if it has no upstream yet)")
+                .on_hover_text("Push… (also publishes a branch that has no upstream yet)")
                 .clicked()
             {
-                acts.push(Action::Push);
+                acts.push(Action::Dialog(self.sync_dialog(sync::SyncKind::Push)));
             }
             widgets::toolbar_separator(ui);
             let head = self.refs.head.clone();

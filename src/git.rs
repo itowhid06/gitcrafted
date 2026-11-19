@@ -11,7 +11,7 @@ const RS: char = '\x1e';
 /// How many commits the graph loads at a time; scrolling to the end loads the next page.
 pub const LOG_PAGE: usize = 1500;
 
-fn git_cmd() -> Command {
+pub(crate) fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
     // Never block on an interactive prompt: credential helpers with a GUI still work.
     cmd.env("GIT_TERMINAL_PROMPT", "0");

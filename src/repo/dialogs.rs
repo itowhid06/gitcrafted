@@ -69,6 +69,18 @@ pub enum Dialog {
         url: String,
         focus: bool,
     },
+    /// A dialog defined in its own file (see `ext.rs`).
+    Ext(Box<dyn super::ext::DialogBody>),
+    /// Fetch, pull or push, with their options.
+    Sync(super::sync::SyncDialog),
+    /// Add a submodule: its URL and the folder it goes in.
+    AddSubmodule {
+        url: String,
+        path: String,
+        /// The user typed a folder; stop suggesting one from the URL.
+        path_edited: bool,
+        focus: bool,
+    },
     /// Username and password / token for an HTTPS remote that asked for them.
     Credentials {
         url: String,
@@ -241,7 +253,7 @@ impl Dialog {
     }
 }
 
-enum Outcome {
+pub(crate) enum Outcome {
     Open,
     /// Still open; the branch changed, so suggest a folder again.
     Suggest,
@@ -599,6 +611,31 @@ impl RepoTab {
                         }
                     })
                 }
+                Dialog::Sync(sync) => sync.ui(ui, &t, enter),
+                Dialog::Ext(body) => body.ui(ui, &t, enter),
+                Dialog::AddSubmodule { url, path, path_edited, focus } => {
+                    title(ui, "Add submodule", "The repository to embed and the folder it goes in.", &t);
+                    if field(ui, url, "https://github.com/user/repo.git", focus).changed() && !*path_edited {
+                        *path = super::submodules::folder_from_url(url);
+                    }
+                    ui.add_space(4.0);
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(path)
+                            .hint_text("libs/repo")
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::Margin::symmetric(8, 6)),
+                    );
+                    if edit.changed() {
+                        *path_edited = true;
+                    }
+                    ui.add_space(8.0);
+                    let valid = !url.trim().is_empty() && !path.trim().is_empty();
+                    buttons(ui, "Add", valid, enter, || Action::Ops {
+                        label: format!("Add submodule {}", path.trim()),
+                        ops: super::submodules::add_ops(url.trim(), path.trim()),
+                        refresh: Refresh::All,
+                    })
+                }
                 Dialog::Credentials { url, refused, username, password, focus } => {
                     let host = host_of(url);
                     title(
@@ -743,7 +780,7 @@ fn host_of(url: &str) -> &str {
         .unwrap_or("the remote")
 }
 
-fn title(ui: &mut egui::Ui, heading: &str, sub: &str, t: &Tokens) {
+pub(super) fn title(ui: &mut egui::Ui, heading: &str, sub: &str, t: &Tokens) {
     ui.label(RichText::new(heading).font(theme::semibold(15.0)));
     ui.label(RichText::new(sub).color(t.text_dim));
     ui.add_space(10.0);
@@ -765,7 +802,7 @@ fn field(ui: &mut egui::Ui, text: &mut String, hint: &str, focus: &mut bool) -> 
 }
 
 /// The primary button (also Enter, when `enter`) and Cancel.
-fn buttons(
+pub(super) fn buttons(
     ui: &mut egui::Ui,
     label: &str,
     valid: bool,
