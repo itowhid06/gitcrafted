@@ -335,7 +335,7 @@ mod tests {
         let run = |args: &[&str]| {
             git::run(
                 Some(&dir),
-                &[&["-c", "user.name=t", "-c", "user.email=t@t"][..], args].concat(),
+                &[&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false"][..], args].concat(),
             )
         };
         assert!(run(&["init", "-q", "-b", "main"]).is_ok());

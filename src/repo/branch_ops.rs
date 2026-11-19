@@ -430,7 +430,14 @@ mod tests {
                 .arg("-C")
                 .arg(dir)
                 .env("GIT_EDITOR", "true")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "core.autocrlf=false",
+                ])
                 .args(args)
                 .output()
                 .map(|o| o.status.success())
@@ -1126,7 +1133,7 @@ mod review_tests {
         }
         git(&dir, &["checkout", "--", "a.txt"]);
         f.tab.reload_status(&f.ctx);
-        f.pump();
+        f.pump_until(|f| f.tab.patch_sel.is_empty());
         assert!(f.tab.patch_sel.is_empty());
     }
 }

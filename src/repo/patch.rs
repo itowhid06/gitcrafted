@@ -532,7 +532,7 @@ mod tests {
         Command::new("git")
             .arg("-C")
             .arg(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false"])
             .args(args)
             .output()
             .map(|o| o.status.success())

@@ -760,6 +760,8 @@ mod tests {
                     "user.name=t",
                     "-c",
                     "user.email=t@t",
+                "-c",
+                "core.autocrlf=false",
                 ])
                 .args(args)
                 .output()

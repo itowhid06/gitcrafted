@@ -56,6 +56,9 @@ fn command(dir: &Path, args: &[&str]) -> Command {
             "init.defaultBranch=main",
             "-c",
             "commit.gpgsign=false",
+            // Git for Windows converts line endings by default, also while a clone checks out.
+            "-c",
+            "core.autocrlf=false",
         ])
         .args(args);
     cmd
@@ -199,17 +202,33 @@ impl Fixture {
         f
     }
 
-    /// Handles background answers until nothing is loading or running for a moment.
+    /// Handles the answers that have arrived. Returns whether there were any.
+    pub fn drain(&mut self) -> bool {
+        let mut got = false;
+        while let Ok(msg) = self.tab.rx.try_recv() {
+            self.tab.handle(msg, &self.ctx);
+            got = true;
+        }
+        got
+    }
+
+    /// A commit's details were asked for and have not arrived.
+    fn detail_pending(&self) -> bool {
+        let tab = &self.tab;
+        tab.detail_hash.as_ref().is_some_and(|h| {
+            tab.detail_error.is_none() && tab.detail.as_ref().is_none_or(|d| d.hash != *h)
+        })
+    }
+
+    /// Handles background answers until nothing is loading, running or on its way for a moment.
+    /// (git starts slowly on Windows: the moment is longer there.)
     pub fn pump(&mut self) {
         let start = Instant::now();
         let mut quiet = 0;
-        while quiet < 4 {
-            let mut got = false;
-            while let Ok(msg) = self.tab.rx.try_recv() {
-                self.tab.handle(msg, &self.ctx);
-                got = true;
-            }
-            if got || self.tab.loading || self.tab.busy_op.is_some() {
+        let needed = if cfg!(windows) { 14 } else { 4 };
+        while quiet < needed {
+            let got = self.drain();
+            if got || self.tab.loading || self.tab.busy_op.is_some() || self.detail_pending() {
                 quiet = 0;
             } else {
                 quiet += 1;
@@ -220,6 +239,21 @@ impl Fixture {
             );
             std::thread::sleep(Duration::from_millis(15));
         }
+    }
+
+    /// Handles answers until `done` is true (an answer no flag announces, like an older commit's
+    /// reword that starts by reading the commits to replay), then settles.
+    pub fn pump_until(&mut self, mut done: impl FnMut(&mut Fixture) -> bool) {
+        let start = Instant::now();
+        while !done(self) {
+            self.drain();
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the awaited answer never came"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        self.pump();
     }
 
     /// Applies an action and waits for it and the reload after it.

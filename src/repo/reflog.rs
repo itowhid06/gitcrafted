@@ -328,6 +328,8 @@ mod review_tests {
                 "user.name=t",
                 "-c",
                 "user.email=t@t",
+                "-c",
+                "core.autocrlf=false",
                 "commit",
                 "-q",
                 "-m",

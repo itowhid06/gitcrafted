@@ -193,7 +193,14 @@ mod tests {
             Command::new("git")
                 .arg("-C")
                 .arg(dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "core.autocrlf=false",
+                ])
                 .args(args)
                 .output()
                 .map(|o| o.status.success())
@@ -522,7 +529,8 @@ mod flow_tests {
             hash: hashes[1].clone(),
             message: "second, reworded".to_owned(),
         });
-        f.pump();
+        let dir = f.dir().to_path_buf();
+        f.pump_until(|_| git(&dir, &["log", "--format=%s"]).contains("second, reworded"));
         assert!(!f.failed(), "{:?}", f.status());
         let subjects = git(&dir, &["log", "--format=%s"]);
         assert_eq!(subjects, "third\nsecond, reworded\ninitial");
@@ -582,7 +590,8 @@ mod safety_tests {
             hash: second,
             message: "second, reworded".to_owned(),
         });
-        f.pump();
+        let dir = f.dir().to_path_buf();
+        f.pump_until(|_| git(&dir, &["log", "--format=%s"]).contains("second, reworded"));
         assert!(!f.failed(), "{:?}", f.status());
         assert_eq!(
             git(&dir, &["log", "--format=%s"]),
