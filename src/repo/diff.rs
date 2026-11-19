@@ -952,8 +952,11 @@ impl RepoTab {
             &data.unified_runs
         };
         let area = ui.available_rect_before_wrap();
-        let strip = Rect::from_min_max(pos2(area.right() - MAP_W, area.top()), area.max);
-        let body = Rect::from_min_max(area.min, pos2(strip.left() - 1.0, area.bottom()));
+        let strip_w = MAP_W.min(area.width().max(0.0));
+        let strip_left = (area.right() - strip_w).max(area.left());
+        let strip = Rect::from_min_max(pos2(strip_left, area.top()), area.max);
+        let body_right = (strip.left() - 1.0).max(area.left());
+        let body = Rect::from_min_max(area.min, pos2(body_right, area.bottom()));
         let total_h = rows as f32 * LINE_H;
         let map = ui
             .interact(
@@ -984,7 +987,7 @@ impl RepoTab {
                     // Each half is half of what's visible, however long the lines: scrolling
                     // sideways moves the text in both, the line numbers stay.
                     let view = ui.clip_rect();
-                    let half = (view.width() / 2.0).floor();
+                    let half = (view.width().max(0.0) / 2.0).floor().max(1.0);
                     let overflow = (NUM_W + 24.0 + longest * char_w + 16.0 - half).max(0.0);
                     for row in range {
                         let Some(&(l, r)) = data.split.get(row) else {
@@ -1500,6 +1503,9 @@ fn line_job(
 }
 
 fn image_view(ui: &mut Ui, images: &ImagePair) {
+    if ui.available_width() < 24.0 || ui.available_height() < 24.0 {
+        return;
+    }
     let t = Tokens::get(ui.ctx());
     ui.add_space(12.0);
     ui.columns(2, |cols| {
@@ -1517,7 +1523,10 @@ fn image_view(ui: &mut Ui, images: &ImagePair) {
                 match bytes {
                     Some(bytes) => {
                         let uri = format!("bytes://diff/{}/{side}.png", images.id);
-                        let max = vec2(ui.available_width() - 16.0, ui.available_height() - 40.0);
+                        let max = vec2(
+                            (ui.available_width() - 16.0).max(1.0),
+                            (ui.available_height() - 40.0).max(1.0),
+                        );
                         ui.add(
                             egui::Image::from_bytes(uri, Bytes::Shared(bytes.clone()))
                                 .max_size(max)
@@ -1875,5 +1884,26 @@ mod tests {
         let rev =
             partial_patch(del_header, &del_lines, &chosen, Pick::Unstage).unwrap_or_default();
         assert!(rev.contains("@@ -1,1 +0,0 @@"), "{rev}");
+    }
+
+    #[test]
+    fn image_view_survives_tiny_viewport_without_panicking() {
+        let png = include_bytes!("../../assets/app-icon/gitcrafted-256.png");
+        let images = ImagePair {
+            id: "tiny".to_owned(),
+            old: Some(std::sync::Arc::from(png.as_slice())),
+            new: Some(std::sync::Arc::from(png.as_slice())),
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([10.0, 20.0])
+            .build_ui(move |ui| {
+                if ui.ctx().cumulative_frame_nr() == 0 {
+                    crate::theme::install_fonts(ui.ctx());
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                image_view(ui, &images);
+            });
+        harness.run();
     }
 }

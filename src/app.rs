@@ -97,6 +97,8 @@ pub struct App {
     manual_open: bool,
     palette: Option<Palette>,
     toasts: Vec<Toast>,
+    /// Saved open tabs preserved if git was temporarily unavailable on startup.
+    pending_saved_open: Option<(Vec<PathBuf>, usize)>,
     tab_drag: Option<TabDrag>,
 }
 
@@ -167,6 +169,7 @@ impl App {
             manual_open: false,
             palette: None,
             toasts: Vec::new(),
+            pending_saved_open: None,
             tab_drag: None,
             error: None,
             was_focused: true,
@@ -198,6 +201,8 @@ impl App {
                     app.tabs.push(Tab::Repo(Box::new(RepoTab::new(path, ctx))));
                 }
             }
+        } else if !saved.open.is_empty() {
+            app.pending_saved_open = Some((saved.open, saved.active));
         }
         if app.tabs.is_empty() {
             app.tabs.push(Tab::Home);
@@ -436,10 +441,21 @@ impl App {
             let natural_total: f32 =
                 (titles.iter().map(|g| g.2 + GAP).sum::<f32>() - GAP).max(0.0);
             if natural_total > max_strip && n > 0 {
-                let scale = max_strip / natural_total;
-                let min_w = (max_strip / n as f32).clamp(48.0, 110.0);
+                let gaps = GAP * (n.saturating_sub(1) as f32);
+                let avail_tabs = (max_strip - gaps).max(0.0);
+                let sum_w: f32 = titles.iter().map(|g| g.2).sum::<f32>().max(1.0);
+                let scale = avail_tabs / sum_w;
+                let max_per_tab = (avail_tabs / n as f32).max(16.0);
+                let min_w = max_per_tab.min(110.0);
                 for item in &mut titles {
                     item.2 = (item.2 * scale).max(min_w);
+                }
+                let clamped_sum: f32 = titles.iter().map(|g| g.2).sum::<f32>();
+                if clamped_sum > avail_tabs && clamped_sum > 0.0 {
+                    let fix = avail_tabs / clamped_sum;
+                    for item in &mut titles {
+                        item.2 *= fix;
+                    }
                 }
             }
             let width = |i: usize| titles.get(i).map_or(0.0, |g| g.2);
@@ -966,7 +982,9 @@ impl App {
                         ui.add(egui::Button::new("Cancel").min_size(vec2(80.0, 30.0)));
                     if cancel_btn.clicked() {
                         cancel = true;
-                    } else if clone_btn.clicked() || (enter && valid && !cancel_btn.has_focus()) {
+                    } else if clone_btn.clicked()
+                        || (enter && valid && !cancel_btn.has_focus() && !browse_clicked)
+                    {
                         submit = true;
                     }
                 });
@@ -990,14 +1008,6 @@ impl App {
                 return;
             }
             let dest = PathBuf::from(form.parent.trim()).join(form.name.trim());
-            let occupied = dest.exists()
-                && std::fs::read_dir(&dest)
-                    .map(|mut d| d.next().is_some())
-                    .unwrap_or(true);
-            if occupied {
-                form.error = Some(format!("{} already exists and isn't empty", dest.display()));
-                return;
-            }
             let url = form.url.trim().to_owned();
             let creds = (form.auth && !form.username.trim().is_empty()).then(|| git::Credentials {
                 username: form.username.trim().to_owned(),
@@ -1008,7 +1018,16 @@ impl App {
             let ctx2 = ctx.clone();
             let dest2 = dest.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(git::clone(&url, &dest2, creds.as_ref()));
+                let occupied = dest2.exists()
+                    && std::fs::read_dir(&dest2)
+                        .map(|mut d| d.next().is_some())
+                        .unwrap_or(true);
+                let result = if occupied {
+                    Err(format!("{} already exists and isn't empty", dest2.display()))
+                } else {
+                    git::clone(&url, &dest2, creds.as_ref())
+                };
+                let _ = tx.send(result);
                 ctx2.request_repaint();
             });
             self.cloning = Some((dest, rx));
@@ -1106,6 +1125,20 @@ impl App {
             ui.add_space(16.0);
             if crate::repo::primary_button(ui, "Check again", true, 140.0).clicked() {
                 self.git_version = git::version();
+                if self.git_version.is_ok()
+                    && let Some((open, active)) = self.pending_saved_open.take()
+                {
+                    let ctx = ui.ctx();
+                    let restored: Vec<Tab> = open
+                        .into_iter()
+                        .filter(|p| p.is_dir())
+                        .map(|p| Tab::Repo(Box::new(RepoTab::new(p, ctx))))
+                        .collect();
+                    if !restored.is_empty() {
+                        self.tabs = restored;
+                        self.active = active.min(self.tabs.len() - 1);
+                    }
+                }
             }
             ui.add_space(8.0);
             ui.hyperlink_to("Download git", "https://git-scm.com/downloads");
@@ -1145,10 +1178,12 @@ impl eframe::App for App {
         // A focused text field, the terminal, or any open dialog keeps these keys for itself.
         let repo_dialog =
             matches!(self.tabs.get(self.active), Some(Tab::Repo(r)) if r.has_dialog());
+        let popup_open = egui::Popup::is_any_open(&ctx);
         let modal_open = self.clone_form.is_some()
             || self.palette.is_some()
             || self.manual_open
             || repo_dialog
+            || popup_open
             || ctx.egui_wants_keyboard_input();
         let wants_kb = ctx.egui_wants_keyboard_input();
         let (new_tab, close, refresh, focused, palette, manual) = ctx.input(|i| {
@@ -1164,14 +1199,14 @@ impl eframe::App for App {
         if manual
             && self.clone_form.is_none()
             && self.palette.is_none()
-            && (self.manual_open || (!repo_dialog && !wants_kb))
+            && (self.manual_open || (!repo_dialog && !popup_open && !wants_kb))
         {
             self.manual_open = !self.manual_open;
         }
         if palette && self.clone_form.is_none() {
             if self.palette.is_some() {
                 self.palette = None;
-            } else if !self.manual_open && !repo_dialog && !wants_kb {
+            } else if !self.manual_open && !repo_dialog && !popup_open && !wants_kb {
                 self.open_palette();
             }
         }
@@ -1258,22 +1293,29 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        let open: Vec<PathBuf> = self
-            .tabs
-            .iter()
-            .filter_map(|t| match t {
-                Tab::Repo(r) => Some(r.path.clone()),
-                Tab::Home | Tab::Settings => None,
-            })
-            .collect();
-        // Index of the active tab among the saved (repo) tabs.
-        let active = self
-            .tabs
-            .iter()
-            .take(self.active + 1)
-            .filter(|t| matches!(t, Tab::Repo(_)))
-            .count()
-            .saturating_sub(1);
+        let (open, active) = if self.git_version.is_err()
+            && let Some((open, active)) = self.pending_saved_open.clone()
+        {
+            (open, active)
+        } else {
+            let open: Vec<PathBuf> = self
+                .tabs
+                .iter()
+                .filter_map(|t| match t {
+                    Tab::Repo(r) => Some(r.path.clone()),
+                    Tab::Home | Tab::Settings => None,
+                })
+                .collect();
+            // Index of the active tab among the saved (repo) tabs.
+            let active = self
+                .tabs
+                .iter()
+                .take(self.active + 1)
+                .filter(|t| matches!(t, Tab::Repo(_)))
+                .count()
+                .saturating_sub(1);
+            (open, active)
+        };
         let saved = Saved {
             open,
             active,
@@ -1518,41 +1560,15 @@ impl App {
         let Some(palette) = &mut self.palette else {
             return;
         };
-        let query = palette.query.to_lowercase();
-        let shown: Vec<usize> = (0..entries.len())
-            .filter(|&i| fuzzy(&entries[i].0.to_lowercase(), &query))
-            .take(60)
-            .collect();
-        palette.selected = palette.selected.min(shown.len().saturating_sub(1));
-        let (up, down, enter, esc) = ctx.input(|i| {
+        let (up, down, enter) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowUp),
                 i.key_pressed(Key::ArrowDown),
                 i.key_pressed(Key::Enter),
-                i.key_pressed(Key::Escape),
             )
         });
-        if down {
-            palette.selected = (palette.selected + 1).min(shown.len().saturating_sub(1));
-        }
-        if up {
-            palette.selected = palette.selected.saturating_sub(1);
-        }
         let mut run = None;
-        let mut close = esc;
         let screen = ctx.content_rect();
-        let backdrop = egui::Area::new(egui::Id::new("palette-backdrop"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                let r = ui.allocate_response(screen.size(), Sense::click());
-                ui.painter()
-                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(60));
-                r
-            });
-        if backdrop.inner.clicked() {
-            close = true;
-        }
         let palette_w = (screen.width() - 32.0).clamp(260.0, 560.0);
         let frame = egui::Frame::new()
             .fill(t.card)
@@ -1560,74 +1576,90 @@ impl App {
             .corner_radius(t.radius_lg)
             .inner_margin(egui::Margin::same(10))
             .shadow(ctx.global_style().visuals.window_shadow);
-        let area = egui::Area::new(egui::Id::new("palette"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0));
-        area.show(ctx, |ui| {
-            frame.show(ui, |ui| {
-                ui.set_width(palette_w);
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut palette.query)
-                        .hint_text("Type a command or a branch…")
-                        .desired_width(f32::INFINITY)
-                        .margin(egui::Margin::symmetric(10, 8))
-                        .font(theme::medium(14.0)),
-                );
-                if std::mem::take(&mut palette.focus) {
-                    edit.request_focus();
-                }
-                if edit.changed() {
-                    palette.selected = 0;
-                }
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .max_height((screen.height() - 160.0).clamp(140.0, 380.0))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        for (k, &i) in shown.iter().enumerate() {
-                            let (label, hint, _) = &entries[i];
-                            let (rect, r) = ui.allocate_exact_size(
-                                vec2(ui.available_width(), 28.0),
-                                Sense::click(),
-                            );
-                            if k == palette.selected {
-                                ui.painter().rect_filled(rect, t.radius_sm, t.row_selected);
-                                if up || down {
-                                    ui.scroll_to_rect(rect, None);
-                                }
-                            } else if r.hovered() {
-                                ui.painter().rect_filled(rect, t.radius_sm, t.hover);
+        let modal = egui::Modal::new(egui::Id::new("palette"))
+            .area(
+                egui::Area::new(egui::Id::new("palette"))
+                    .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0)),
+            )
+            .frame(frame)
+            .backdrop_color(egui::Color32::from_black_alpha(60));
+        let mut shown: Vec<usize> = Vec::new();
+        let resp = modal.show(ctx, |ui| {
+            ui.set_width(palette_w);
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut palette.query)
+                    .hint_text("Type a command or a branch…")
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(10, 8))
+                    .font(theme::medium(14.0)),
+            );
+            if std::mem::take(&mut palette.focus) {
+                edit.request_focus();
+            }
+            if edit.changed() {
+                palette.selected = 0;
+            }
+            let query = palette.query.to_lowercase();
+            shown = (0..entries.len())
+                .filter(|&i| fuzzy(&entries[i].0.to_lowercase(), &query))
+                .take(60)
+                .collect();
+            palette.selected = palette.selected.min(shown.len().saturating_sub(1));
+            if down {
+                palette.selected = (palette.selected + 1).min(shown.len().saturating_sub(1));
+            }
+            if up {
+                palette.selected = palette.selected.saturating_sub(1);
+            }
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .max_height((screen.height() - 160.0).clamp(140.0, 380.0))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (k, &i) in shown.iter().enumerate() {
+                        let (label, hint, _) = &entries[i];
+                        let (rect, r) = ui.allocate_exact_size(
+                            vec2(ui.available_width(), 28.0),
+                            Sense::click(),
+                        );
+                        if k == palette.selected {
+                            ui.painter().rect_filled(rect, t.radius_sm, t.row_selected);
+                            if up || down {
+                                ui.scroll_to_rect(rect, None);
                             }
-                            let hint_rect = ui.painter().text(
-                                pos2(rect.right() - 10.0, rect.center().y),
-                                Align2::RIGHT_CENTER,
-                                hint,
-                                egui::FontId::proportional(11.0),
-                                t.text_faint,
-                            );
-                            let label_max_x = (hint_rect.left() - 12.0).max(rect.left() + 10.0);
-                            let label_clip = Rect::from_min_max(
-                                rect.min,
-                                pos2(label_max_x, rect.bottom()),
-                            );
-                            ui.painter().with_clip_rect(label_clip).text(
-                                pos2(rect.left() + 10.0, rect.center().y),
-                                Align2::LEFT_CENTER,
-                                label,
-                                egui::FontId::proportional(13.0),
-                                t.text,
-                            );
-                            if r.clicked() {
-                                run = Some(i);
-                            }
+                        } else if r.hovered() {
+                            ui.painter().rect_filled(rect, t.radius_sm, t.hover);
                         }
-                        if shown.is_empty() {
-                            ui.label(RichText::new("Nothing matches").color(t.text_faint));
+                        let hint_rect = ui.painter().text(
+                            pos2(rect.right() - 10.0, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            hint,
+                            egui::FontId::proportional(11.0),
+                            t.text_faint,
+                        );
+                        let label_max_x = (hint_rect.left() - 12.0).max(rect.left() + 10.0);
+                        let label_clip = Rect::from_min_max(
+                            rect.min,
+                            pos2(label_max_x, rect.bottom()),
+                        );
+                        ui.painter().with_clip_rect(label_clip).text(
+                            pos2(rect.left() + 10.0, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(13.0),
+                            t.text,
+                        );
+                        if r.clicked() {
+                            run = Some(i);
                         }
-                    });
-            });
+                    }
+                    if shown.is_empty() {
+                        ui.label(RichText::new("Nothing matches").color(t.text_faint));
+                    }
+                });
         });
-        if enter && let Some(&i) = shown.get(palette.selected) {
+        let close = resp.should_close();
+        if enter && !close && let Some(&i) = shown.get(palette.selected) {
             run = Some(i);
         }
         if close || run.is_some() {

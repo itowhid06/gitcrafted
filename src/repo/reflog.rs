@@ -149,6 +149,7 @@ impl DialogBody for ReflogDialog {
                     });
                     return;
                 }
+                let mut shown_any = false;
                 for (i, e) in self.entries.iter().enumerate() {
                     if !filter.is_empty()
                         && !e.message.to_lowercase().contains(&filter)
@@ -156,6 +157,7 @@ impl DialogBody for ReflogDialog {
                     {
                         continue;
                     }
+                    shown_any = true;
                     let selected = self.selected == Some(i);
                     let (rect, resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), 24.0),
@@ -208,11 +210,17 @@ impl DialogBody for ReflogDialog {
                 }
                 if self.entries.is_empty() && self.error.is_none() {
                     ui.label(RichText::new("The reflog is empty").color(t.text_faint));
+                } else if !shown_any && self.error.is_none() {
+                    ui.label(RichText::new("No matching reflog entries").color(t.text_faint));
                 }
             });
         ui.add_space(8.0);
         let mut outcome = Outcome::Open;
-        let picked = self.selected.and_then(|i| self.entries.get(i));
+        let picked = self.selected.and_then(|i| self.entries.get(i)).filter(|e| {
+            filter.is_empty()
+                || e.message.to_lowercase().contains(&filter)
+                || e.hash.starts_with(&filter)
+        });
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(picked.is_some(), |ui| {
                 let hash = picked.map(|e| e.hash.clone()).unwrap_or_default();

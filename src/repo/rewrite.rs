@@ -90,12 +90,17 @@ impl RepoTab {
     /// Selects `hash` and opens its message editor once its details are loaded.
     pub(super) fn start_edit_message(&mut self, hash: String, ctx: &egui::Context) {
         self.pending_edit = None;
+        self.compare = None;
         if self.detail.as_ref().is_some_and(|d| d.hash == hash) {
             self.open_message_editor();
             return;
         }
         self.pending_edit = Some(hash.clone());
-        self.goto(&hash, ctx);
+        if self.detail_error.is_some() && self.detail_hash.as_deref() == Some(hash.as_str()) {
+            self.load_detail(hash, ctx);
+        } else {
+            self.goto(&hash, ctx);
+        }
     }
 
     /// Opens the editor for the commit shown in the detail pane, when its message can be edited:
@@ -549,6 +554,101 @@ mod flow_tests {
             short(&git(&dir, &["rev-parse", "HEAD~1"])),
             short(&hashes[1])
         );
+    }
+
+    #[test]
+    fn reword_editor_renders_and_handles_keys_without_deadlocking() {
+        let (dir, hashes) = history("rw-reword-ui");
+        let f = std::rc::Rc::new(std::cell::RefCell::new(Fixture::open(&dir)));
+
+        // Verify rendering at both standard and narrow viewports does not deadlock or panic,
+        // and Esc cancels the inline editor without emitting Action::Reword.
+        for size in [[640.0, 480.0], [280.0, 360.0]] {
+            {
+                let mut fix = f.borrow_mut();
+                let ctx = fix.ctx.clone();
+                fix.tab.start_edit_message(hashes[2].clone(), &ctx);
+                fix.pump();
+                assert!(fix.tab.reword.is_some());
+            }
+            let acts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let fix_ref = f.clone();
+            let acts_ref = acts.clone();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(size)
+                .build_ui(move |ui| {
+                    if ui.ctx().cumulative_frame_nr() == 0 {
+                        crate::theme::install_fonts(ui.ctx());
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    fix_ref
+                        .borrow_mut()
+                        .tab
+                        .detail_panel(ui, &mut acts_ref.borrow_mut());
+                });
+            harness.run();
+            harness.step();
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            drop(harness);
+            assert!(f.borrow().tab.reword.is_none());
+            assert!(acts.borrow().is_empty());
+        }
+
+        // Open compare mode on the same commit, then verify `start_edit_message` clears `compare`,
+        // focuses the summary field, and `Ctrl+Enter` emits `Action::Reword`.
+        {
+            let mut fix = f.borrow_mut();
+            fix.run(Action::Compare {
+                base: hashes[1].clone(),
+                base_label: "second".to_owned(),
+                target: Some(hashes[2].clone()),
+                target_label: "third".to_owned(),
+                since_fork: false,
+            });
+            assert!(fix.tab.compare.is_some());
+            let ctx = fix.ctx.clone();
+            fix.tab.start_edit_message(hashes[2].clone(), &ctx);
+            fix.pump();
+            assert!(fix.tab.compare.is_none());
+            assert!(fix.tab.reword.is_some());
+        }
+
+        let acts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fix_ref = f.clone();
+        let acts_ref = acts.clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([640.0, 480.0])
+            .build_ui(move |ui| {
+                if ui.ctx().cumulative_frame_nr() == 0 {
+                    crate::theme::install_fonts(ui.ctx());
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                fix_ref
+                    .borrow_mut()
+                    .tab
+                    .detail_panel(ui, &mut acts_ref.borrow_mut());
+            });
+        harness.run();
+        harness.step();
+        harness.event(egui::Event::Text(" edited".to_owned()));
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+        harness.run();
+        drop(harness);
+
+        assert!(f.borrow().tab.reword.is_none());
+        let recorded = acts.borrow();
+        assert_eq!(recorded.len(), 1);
+        match &recorded[0] {
+            Action::Reword { hash, message } => {
+                assert_eq!(hash, &hashes[2]);
+                assert!(message.contains("edited"), "unexpected message: {message}");
+            }
+            _ => unreachable!("expected Action::Reword"),
+        }
     }
 }
 

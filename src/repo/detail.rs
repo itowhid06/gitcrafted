@@ -562,13 +562,13 @@ impl RepoTab {
         );
         if f.code != 'D' {
             widgets::file_menu_with(&r.row, &f.path, None, true, acts, |ui, acts| {
-                self.patch_menu_items(ui, acts, f)
+                self.patch_menu_items(ui, acts, f, true)
             });
         } else {
             // A deleted file has nothing to open, but its removal can go in a patch.
             egui::Popup::context_menu(&r.row)
                 .style(crate::theme::menu_style)
-                .show(|ui| self.patch_menu_items(ui, acts, f));
+                .show(|ui| self.patch_menu_items(ui, acts, f, false));
         }
         match r.button {
             Some(i) => RowClick::Button(i),
@@ -586,6 +586,10 @@ impl RepoTab {
         let t = Tokens::get(ui.ctx());
         let idle = self.busy_op.is_none();
         let rebasing = self.work.in_progress == Some(crate::git::InProgress::Rebase);
+        let can_amend = self.work.in_progress.is_none() && !self.refs.head.is_empty();
+        if !can_amend {
+            self.amend = false;
+        }
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(if rebasing {
@@ -599,7 +603,7 @@ impl RepoTab {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let amend = ui
                     .add_enabled(
-                        self.work.in_progress.is_none() && !self.refs.head.is_empty(),
+                        can_amend,
                         egui::Checkbox::new(&mut self.amend, "Amend last commit"),
                     )
                     .on_hover_text(
@@ -925,12 +929,11 @@ fn reword_editor(ui: &mut Ui, reword: &mut Reword, allow_keys: bool) -> Option<b
     );
     ui.add_space(6.0);
     let can_save = !reword.subject.trim().is_empty();
+    let focused = summary.has_focus() || body.has_focus();
     let (save_keys, cancel_keys) = if allow_keys {
         ui.input(|i| {
             (
-                (summary.has_focus() || body.has_focus())
-                    && i.modifiers.command
-                    && i.key_pressed(Key::Enter),
+                focused && i.modifiers.command && i.key_pressed(Key::Enter),
                 i.key_pressed(Key::Escape),
             )
         })
@@ -938,7 +941,7 @@ fn reword_editor(ui: &mut Ui, reword: &mut Reword, allow_keys: bool) -> Option<b
         (false, false)
     };
     let mut out = None;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if widgets::primary_button(ui, "Save message", can_save, 110.0).clicked() {
             out = Some(true);
         }

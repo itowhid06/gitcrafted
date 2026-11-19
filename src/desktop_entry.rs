@@ -202,17 +202,35 @@ fn is_managed_entry(text: &str) -> bool {
             && text.contains("Comment=A visual git client"))
 }
 
+fn unescape_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('s') => out.push(' '),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn try_exec_missing(text: &str) -> bool {
     let Some(raw) = text.lines().find_map(|l| l.strip_prefix("TryExec=")) else {
         return false;
     };
-    let unescaped = raw
-        .trim()
-        .replace("\\s", " ")
-        .replace("\\t", "\t")
-        .replace("\\r", "\r")
-        .replace("\\n", "\n")
-        .replace("\\\\", "\\");
+    let unescaped = unescape_value(raw.trim());
     !unescaped.is_empty() && !Path::new(&unescaped).is_file()
 }
 
@@ -568,6 +586,11 @@ mod tests {
     fn escape_value_escapes_leading_space_and_controls() {
         assert_eq!(escape_value(" leading\nline\\next\r"), "\\sleading\\nline\\\\next\\r");
         assert_eq!(escape_value("tab\there"), "tab\\there");
+        assert_eq!(
+            unescape_value(&escape_value(" leading\nline\\next\\s\\t\r")),
+            " leading\nline\\next\\s\\t\r"
+        );
+        assert_eq!(unescape_value("a\\\\nb\\\\sc"), "a\\nb\\sc");
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub struct Submodule {
     pub behind: u32,
     /// Cloned into the folder (the folder has a `.git`).
     pub initialized: bool,
+    /// The submodule folder currently exists inside the repository.
+    pub dir_exists: bool,
     /// The repository's merge left it conflicted.
     pub conflicted: bool,
     /// Detached, with commits no branch, tag or remote branch has: checking out another commit
@@ -93,7 +95,9 @@ pub fn list(repo: &Path) -> Vec<Submodule> {
                 .unwrap_or_else(|| (link.path.clone(), String::new()));
             let dir = repo.join(&link.path);
             // Only a folder that really is inside the repository counts (no `..`, no symlink out).
-            let initialized = dir.join(".git").exists() && inside(repo, &dir);
+            let in_repo = inside(repo, &dir);
+            let dir_exists = in_repo && dir.is_dir();
+            let initialized = in_repo && dir.join(".git").exists();
             let (head, branch) = if initialized {
                 checked_out(&dir)
             } else {
@@ -113,6 +117,7 @@ pub fn list(repo: &Path) -> Vec<Submodule> {
                 ahead,
                 behind,
                 initialized,
+                dir_exists,
                 conflicted: link.conflicted,
                 unsaved: false,
             }
@@ -600,7 +605,7 @@ fn submodule_menu_items(
     }
     if ui
         .add_enabled(
-            abs.is_dir() && !sub.path.is_empty() && !sub.path.starts_with('-'),
+            sub.dir_exists && !sub.path.is_empty() && !sub.path.starts_with('-'),
             egui::Button::new(super::reveal_label()),
         )
         .clicked()

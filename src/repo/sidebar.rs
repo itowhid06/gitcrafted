@@ -321,6 +321,42 @@ impl RepoTab {
             });
         }
         self.force_push_item(ui, acts, b, idle);
+        let has_remote_branches = self
+            .refs
+            .remotes
+            .iter()
+            .flat_map(|(_, l)| l.iter())
+            .any(|r| !r.name.ends_with("/HEAD"));
+        let track_label = if b.upstream.is_empty() {
+            "Track remote branch…"
+        } else {
+            "Change tracked branch…"
+        };
+        let track_btn = ui.add_enabled(idle && has_remote_branches, egui::Button::new(track_label));
+        let track_btn = if !has_remote_branches {
+            track_btn.on_disabled_hover_text("No remote branches available")
+        } else {
+            track_btn
+        };
+        let track_btn = if !b.upstream.is_empty() {
+            track_btn.on_hover_text(format!("Currently tracks {}", b.upstream))
+        } else {
+            track_btn
+        };
+        if track_btn.clicked() {
+            acts.push(Action::Dialog(self.track_remote_dialog(b)));
+        }
+        if !b.upstream.is_empty()
+            && ui
+                .add_enabled(idle, egui::Button::new(format!("Untrack ({})", b.upstream)))
+                .clicked()
+        {
+            acts.push(super::branch_ops::untrack_action(
+                &b.name,
+                &b.upstream,
+                b.upstream_gone(),
+            ));
+        }
         if let Some(forge) = self.forge {
             let existing = self.prs.iter().find(|p| p.branch == b.name);
             match existing {
@@ -588,6 +624,18 @@ impl RepoTab {
                                     }
                                     ui.separator();
                                     super::graph_view::compare_items(ui, acts, &b.name, current);
+                                    ui.separator();
+                                } else {
+                                    ui.separator();
+                                }
+                                if !b.name.ends_with("/HEAD") {
+                                    self.remote_branch_track_menu_items(
+                                        ui,
+                                        acts,
+                                        &b.name,
+                                        current.as_deref(),
+                                        idle,
+                                    );
                                     ui.separator();
                                 }
                                 if ui.button("Create branch here…").clicked() {

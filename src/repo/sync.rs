@@ -230,6 +230,24 @@ pub(super) fn row<R>(ui: &mut Ui, t: &Tokens, label: &str, add: impl FnOnce(&mut
     .inner
 }
 
+#[derive(Clone, Default)]
+struct SearchPickState {
+    query: String,
+    cursor: usize,
+    focused: bool,
+}
+
+/// Case-insensitive multi-token substring match for branch filtering.
+pub(super) fn matches_branch_filter(name: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    let lower = name.to_lowercase();
+    q.split_ascii_whitespace()
+        .all(|tok| lower.contains(&tok.to_lowercase()))
+}
+
 /// A drop-down filling the line: `show` fills the list and says which entry was picked.
 pub(super) fn pick(
     ui: &mut Ui,
@@ -242,6 +260,145 @@ pub(super) fn pick(
         .width(ui.available_width().max(80.0))
         .selected_text(selected)
         .show_ui(ui, |ui| changed = show(ui));
+    changed
+}
+
+/// A searchable drop-down for potentially large branch lists: pins a live search field at the top,
+/// supports arrow/Enter selection and virtualized scrolling, and resets its filter when closed.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pick_searchable<T: AsRef<str>>(
+    ui: &mut Ui,
+    id: &str,
+    selected: &str,
+    items: &[T],
+    selected_idx: Option<usize>,
+    empty_label: &str,
+    hint: &str,
+    mut on_pick: impl FnMut(usize, &str),
+) -> bool {
+    let w = ui.available_width().max(80.0);
+    let avail = (ui.ctx().content_rect().width() - 24.0).max(160.0);
+    let popup_w = w.clamp(240.0, 420.0).min(avail);
+    let state_id = egui::Id::new(("pick-search-state", ui.make_persistent_id(id)));
+    let scroll_id = state_id.with("scroll");
+    let t = Tokens::get(ui.ctx());
+    let mut changed = false;
+    let ir = egui::ComboBox::from_id_salt(id)
+        .width(w)
+        .height(320.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.set_min_width(popup_w);
+            ui.set_max_width(popup_w);
+            let mut state = ui
+                .ctx()
+                .data(|d| d.get_temp::<SearchPickState>(state_id))
+                .unwrap_or_else(|| SearchPickState {
+                    cursor: selected_idx.unwrap_or(0),
+                    ..Default::default()
+                });
+
+            ui.horizontal(|ui| {
+                let clear_w = if state.query.is_empty() { 0.0 } else { 26.0 };
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut state.query)
+                        .hint_text(hint)
+                        .desired_width((ui.available_width() - clear_w).max(80.0))
+                        .margin(egui::Margin::symmetric(6, 4)),
+                );
+                if !state.focused {
+                    if edit.has_focus() {
+                        state.focused = true;
+                    } else {
+                        edit.request_focus();
+                    }
+                }
+                if edit.changed() {
+                    state.cursor = 0;
+                }
+                if !state.query.is_empty() && ui.small_button("×").clicked() {
+                    state.query.clear();
+                    state.cursor = 0;
+                    edit.request_focus();
+                }
+            });
+
+            let (down, up, enter_key) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::Enter),
+                )
+            });
+
+            let filtered: Vec<(usize, &str)> = items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| (i, item.as_ref()))
+                .filter(|(_, name)| matches_branch_filter(name, &state.query))
+                .collect();
+
+            if !filtered.is_empty() {
+                state.cursor = state.cursor.min(filtered.len() - 1);
+                if down {
+                    state.cursor = (state.cursor + 1).min(filtered.len() - 1);
+                }
+                if up {
+                    state.cursor = state.cursor.saturating_sub(1);
+                }
+                if enter_key {
+                    let (orig_idx, name) = filtered[state.cursor];
+                    on_pick(orig_idx, name);
+                    changed = true;
+                    ui.close();
+                }
+            }
+
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if items.is_empty() {
+                ui.label(RichText::new(empty_label).color(t.text_faint));
+            } else if filtered.is_empty() {
+                ui.label(RichText::new("No matching branches").color(t.text_faint));
+            } else {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                egui::ScrollArea::vertical()
+                    .id_salt(scroll_id)
+                    .max_height(220.0)
+                    .auto_shrink([false, true])
+                    .show_rows(ui, 24.0, filtered.len(), |ui, range| {
+                        for row_idx in range {
+                            let Some(&(orig_idx, name)) = filtered.get(row_idx) else {
+                                continue;
+                            };
+                            let is_cur = row_idx == state.cursor;
+                            let resp = ui
+                                .add_sized(
+                                    [ui.available_width(), 24.0],
+                                    egui::Button::selectable(is_cur, name),
+                                )
+                                .on_hover_text(name);
+                            if (down || up) && is_cur {
+                                resp.scroll_to_me(None);
+                            }
+                            if resp.clicked() {
+                                on_pick(orig_idx, name);
+                                changed = true;
+                                ui.close();
+                            }
+                        }
+                    });
+            }
+
+            if !changed {
+                ui.ctx().data_mut(|d| d.insert_temp(state_id, state));
+            }
+        });
+    if ir.inner.is_none() || changed {
+        ui.ctx()
+            .data_mut(|d| d.remove::<SearchPickState>(state_id));
+    }
     changed
 }
 
@@ -344,16 +501,17 @@ impl Pull {
             } else {
                 self.branch.clone()
             };
-            pick(ui, "pull-branch", &text, |ui| {
-                let mut changed = false;
-                for name in &branches {
-                    if ui.selectable_label(self.branch == *name, name).clicked() {
-                        self.branch = name.clone();
-                        changed = true;
-                    }
-                }
-                changed
-            })
+            let selected_idx = branches.iter().position(|name| name == &self.branch);
+            pick_searchable(
+                ui,
+                "pull-branch",
+                &text,
+                &branches,
+                selected_idx,
+                "No branch on this remote",
+                "Search branches…",
+                |_, name| self.branch = name.to_owned(),
+            )
         });
         row(ui, t, "Into", |ui| {
             ui.label(RichText::new(&self.current).font(crate::theme::semibold(13.0)));
@@ -453,16 +611,17 @@ impl Push {
         title(ui, "Push", "Upload a local branch to a remote branch.", t);
         let branch_changed = row(ui, t, "Branch", |ui| {
             let text = self.locals.get(self.local).map_or("", |(n, _)| n.as_str());
-            pick(ui, "push-local", text, |ui| {
-                let mut changed = false;
-                for (i, (name, _)) in self.locals.iter().enumerate() {
-                    if ui.selectable_label(self.local == i, name).clicked() {
-                        self.local = i;
-                        changed = true;
-                    }
-                }
-                changed
-            })
+            let names: Vec<&str> = self.locals.iter().map(|(n, _)| n.as_str()).collect();
+            pick_searchable(
+                ui,
+                "push-local",
+                text,
+                &names,
+                Some(self.local),
+                "No local branches",
+                "Search branches…",
+                |i, _| self.local = i,
+            )
         });
         if branch_changed {
             self.use_defaults_of_branch();
@@ -1111,5 +1270,82 @@ mod safety_tests {
         f.run(Action::Undo);
         assert!(f.failed(), "undo refuses rather than overwrite");
         assert_eq!(read(&work, "t.txt"), "edited after pulling\n");
+    }
+
+    #[test]
+    fn branch_filter_matches_case_insensitive_multi_token() {
+        assert!(matches_branch_filter("origin/32420-add-ai-images-modal", ""));
+        assert!(matches_branch_filter(
+            "origin/32420-add-ai-images-modal",
+            "   "
+        ));
+        assert!(matches_branch_filter(
+            "32420-add-ai-images-modal",
+            "32420 MODAL"
+        ));
+        assert!(matches_branch_filter(
+            "release-5.20",
+            "RELEASE 5.20"
+        ));
+        assert!(!matches_branch_filter(
+            "32420-add-ai-images-modal",
+            "32420 other"
+        ));
+    }
+
+    #[test]
+    fn pull_branch_dropdown_filters_and_selects_branch() {
+        use egui_kittest::kittest::Queryable;
+
+        let d = std::rc::Rc::new(std::cell::RefCell::new(Pull {
+            remotes: vec!["origin".to_owned()],
+            branches: vec![vec![
+                "main".to_owned(),
+                "32160-alpha-client".to_owned(),
+                "32420-add-images-modal".to_owned(),
+                "32798-dropdown-width".to_owned(),
+            ]],
+            current: "main".to_owned(),
+            remote: 0,
+            branch: "main".to_owned(),
+            how: Integrate::FastForward,
+            autostash: false,
+            no_tags: false,
+            submodules: false,
+            has_submodules: false,
+            unsaved_submodules: false,
+            dirty: false,
+        }));
+        let state = d.clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([640.0, 480.0])
+            .build_ui(move |ui| {
+                if ui.ctx().cumulative_frame_nr() == 0 {
+                    crate::theme::install_fonts(ui.ctx());
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                let t = Tokens::get(ui.ctx());
+                let mut pull = state.borrow_mut();
+                let _ = pull.ui(ui, &t, false);
+            });
+        harness.run();
+        // Click the Pull branch ComboBox (`Into` label also reads `main`, and Remote is also a ComboBox).
+        let branch_box = harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .nth(1);
+        assert!(branch_box.is_some());
+        if let Some(node) = branch_box {
+            node.click();
+        }
+        harness.run();
+        harness.step();
+        // Type a filter query into the auto-focused search box and confirm by pressing Enter.
+        harness.event(egui::Event::Text("32420 modal".to_owned()));
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        drop(harness);
+        assert_eq!(d.borrow().branch, "32420-add-images-modal");
     }
 }

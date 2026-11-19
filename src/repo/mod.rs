@@ -155,6 +155,16 @@ struct PendingOp {
     remote_url: String,
 }
 
+/// A PR/MR creation waiting on HTTPS credentials for its initial `git push`.
+struct PendingPr {
+    branch: String,
+    base: String,
+    title: String,
+    body: String,
+    draft: bool,
+    remote_url: String,
+}
+
 #[derive(Clone, Debug)]
 enum OpKind {
     Normal(Undo, String),
@@ -490,6 +500,9 @@ pub struct RepoTab {
     credentials: HashMap<String, git::Credentials>,
     /// The last user-initiated operation started, to run again after signing in.
     last_op: Option<PendingOp>,
+    pending_pr: Option<PendingPr>,
+    /// Whether an egui widget held keyboard focus at the end of the previous frame (for Esc).
+    was_typing: bool,
     /// Structured checkout target while a checkout is running (for blocked-checkout recovery).
     pending_checkout: Option<branch_ops::CheckoutTarget>,
     /// The forge has been asked for avatars.
@@ -602,6 +615,8 @@ impl RepoTab {
             reword: None,
             credentials: HashMap::new(),
             last_op: None,
+            pending_pr: None,
+            was_typing: false,
             pending_checkout: None,
             avatars_hinted: false,
             diff_ignore_ws: false,
@@ -976,15 +991,19 @@ impl RepoTab {
         let Some(commit) = self.commits.get(row) else {
             return;
         };
-        let stash = self.stash_at(row);
-        if self.selected == Some(row) && self.stash_view == stash {
-            return;
-        }
         let hash = commit.hash.clone();
-        self.selected = Some(row);
-        self.stash_view = stash;
+        let stash = self.stash_at(row);
         self.file_view = None;
         self.compare = None;
+        self.rebase = None;
+        if self.selected == Some(row) && self.stash_view == stash {
+            if hash != WIP_HASH {
+                self.clear_diff(ctx);
+            }
+            return;
+        }
+        self.selected = Some(row);
+        self.stash_view = stash;
         if matches!(
             self.diff,
             Some(DiffView {
@@ -1070,6 +1089,7 @@ impl RepoTab {
             self.clear_diff(ctx);
             return;
         }
+        self.rebase = None;
         self.clear_diff(ctx);
         self.conflict = match &key {
             DiffKey::Work(file) if file.area == git::Area::Conflicted => {
@@ -1159,6 +1179,7 @@ impl RepoTab {
         tab: file_view::FileTab,
         ctx: &egui::Context,
     ) {
+        self.rebase = None;
         self.clear_diff(ctx);
         let view = match self.file_view.take() {
             Some(mut v) if v.path == path && v.rev == rev => {
@@ -1480,14 +1501,19 @@ impl RepoTab {
             .current
             .clone()
             .unwrap_or_else(|| self.refs.head.clone());
+        let undo = if previous.is_empty() {
+            Undo::None
+        } else {
+            Undo::Custom {
+                undo: ops(&[&["checkout", &previous], &["branch", "-D", &local]]),
+                redo: ops(&[&["checkout", "--track", remote_branch]]),
+            }
+        };
         self.run_undoable(
             &format!("Checkout {local}"),
             ops(&[&["checkout", "--track", remote_branch]]),
             Refresh::All,
-            Undo::Custom {
-                undo: ops(&[&["checkout", &previous], &["branch", "-D", &local]]),
-                redo: ops(&[&["checkout", "--track", remote_branch]]),
-            },
+            undo,
             ctx,
         );
     }
@@ -1601,8 +1627,12 @@ impl RepoTab {
             self.status = Some(("Write a commit summary first".to_owned(), true));
             return;
         }
+        let amend = self.amend && self.work.in_progress.is_none() && !self.refs.head.is_empty();
+        if self.work.in_progress.is_some() {
+            self.amend = false;
+        }
         let mut commit = vec!["commit".to_owned()];
-        if self.amend {
+        if amend {
             commit.push("--amend".to_owned());
         }
         commit.extend(["-m".to_owned(), summary.to_owned()]);
@@ -1613,11 +1643,11 @@ impl RepoTab {
         let mut steps = Vec::new();
         // Nothing staged: commit everything, like "Stage all and commit" (an amend with
         // nothing staged only rewrites the message).
-        if self.work.staged.is_empty() && !self.amend {
+        if self.work.staged.is_empty() && !amend {
             steps.push(vec!["add".to_owned(), "-A".to_owned()]);
         }
         steps.push(commit);
-        let label = if self.amend { "Amend" } else { "Commit" };
+        let label = if amend { "Amend" } else { "Commit" };
         self.run_undoable(
             label,
             steps,
@@ -2114,6 +2144,7 @@ impl RepoTab {
                     Ok(_) => {
                         if !quiet {
                             self.last_op = None;
+                            self.pending_pr = None;
                         }
                         if label == "Commit" || label == "Amend" || label == "Continue rebase" {
                             self.commit_summary.clear();
@@ -2144,6 +2175,12 @@ impl RepoTab {
                             .map(|o| o.remote_url.clone())
                             .filter(|u| !u.is_empty())
                             .or_else(|| {
+                                self.pending_pr
+                                    .as_ref()
+                                    .map(|p| p.remote_url.clone())
+                                    .filter(|u| !u.is_empty())
+                            })
+                            .or_else(|| {
                                 self.default_remote()
                                     .and_then(|r| self.remotes.iter().find(|x| x.name == r))
                                     .map(|r| r.url.clone())
@@ -2155,6 +2192,7 @@ impl RepoTab {
                     }
                     Err(e) => {
                         if !quiet {
+                            self.pending_pr = None;
                             if let Some(step) = failed_step
                                 && let Some(op) = &mut self.last_op
                             {
@@ -2359,6 +2397,14 @@ impl RepoTab {
                 self.op_started = Some(Instant::now());
                 self.status = None;
                 self.last_op = None;
+                self.pending_pr = Some(PendingPr {
+                    branch: branch.clone(),
+                    base: base.clone(),
+                    title: title.clone(),
+                    body: body.clone(),
+                    draft,
+                    remote_url,
+                });
                 let path = self.path.clone();
                 spawn(&self.tx, ctx, move || {
                     // Publish the branch first, so the forge can see it.
@@ -2498,6 +2544,26 @@ impl RepoTab {
                     };
                     self.credentials.insert(key, creds);
                     self.run_ops_ex(&op.label, op.ops, op.refresh, op.kind, op.quiet, ctx);
+                } else if let Some(pr) = self.pending_pr.take() {
+                    let key = if pr.remote_url.is_empty() {
+                        self.default_remote()
+                            .and_then(|r| self.remotes.iter().find(|x| x.name == r))
+                            .map(|r| credential_key(&r.url))
+                            .unwrap_or_else(|| "__default__".to_owned())
+                    } else {
+                        credential_key(&pr.remote_url)
+                    };
+                    self.credentials.insert(key, creds);
+                    self.apply(
+                        Action::CreatePr {
+                            branch: pr.branch,
+                            base: pr.base,
+                            title: pr.title,
+                            body: pr.body,
+                            draft: pr.draft,
+                        },
+                        ctx,
+                    );
                 }
             }
             Action::Ignore { pattern, path } => match git::add_to_gitignore(&self.path, &pattern) {
@@ -2511,6 +2577,7 @@ impl RepoTab {
                         } else {
                             format!("`{path}`")
                         };
+                        let lit = ext::literal(&path);
                         self.dialog = Some(Dialog::confirm(
                             "Stop tracking in git?",
                             format!(
@@ -2518,7 +2585,7 @@ impl RepoTab {
                                  Remove it from git's index while keeping your local file(s) on disk?"
                             ),
                             "Stop tracking",
-                            ops(&[&["rm", "-r", "--cached", "--quiet", "--", &path]]),
+                            ops(&[&["rm", "-r", "--cached", "--quiet", "--", &lit]]),
                             None,
                         ));
                     } else {
@@ -2659,8 +2726,11 @@ impl RepoTab {
         let t = Tokens::get(&ctx);
         let mut acts: Vec<Action> = std::mem::take(&mut self.queued);
 
-        let free_keys =
-            self.dialog.is_none() && !self.keys_blocked && !ctx.egui_wants_keyboard_input();
+        let popup_open = egui::Popup::is_any_open(&ctx);
+        let free_keys = !self.has_dialog()
+            && !self.keys_blocked
+            && !popup_open
+            && !ctx.egui_wants_keyboard_input();
         if free_keys {
             let (esc, undo, redo, find) = ctx.input(|i| {
                 (
@@ -2671,6 +2741,7 @@ impl RepoTab {
                     i.modifiers.command && i.key_pressed(Key::F),
                 )
             });
+            let esc = esc && !self.was_typing && self.reword.is_none();
             if esc && self.diff.is_some() {
                 acts.push(Action::CloseDiff);
             } else if esc && self.rebase.is_some() {
@@ -2692,7 +2763,12 @@ impl RepoTab {
                 self.search.open = true;
                 self.search.focus = true;
             }
-        } else if self.search.open && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F)) {
+        } else if self.search.open
+            && !self.has_dialog()
+            && !self.keys_blocked
+            && !popup_open
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F))
+        {
             self.search.focus = true;
         }
 
@@ -2746,6 +2822,7 @@ impl RepoTab {
         for action in acts {
             self.apply(action, &ctx);
         }
+        self.was_typing = ctx.egui_wants_keyboard_input();
     }
 
     fn toolbar(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
@@ -3287,5 +3364,118 @@ error: failed to push some refs";
             "Push failed: error: failed to push some refs"
         );
         assert_eq!(headline("Fetch: done"), "Fetch: done");
+    }
+
+    #[test]
+    fn ignore_tracked_file_uses_literal_pathspec_and_select_clears_overlays() {
+        use super::test_support::*;
+        use super::{Action, Dialog};
+
+        let dir = repo("mod-audit-fixes");
+        write(&dir, "glob[1].txt", "hello\n");
+        git(&dir, &["add", "--", ":(literal)glob[1].txt"]);
+        git(&dir, &["commit", "-q", "-m", "add glob file"]);
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        let mut f = Fixture::open(&dir);
+
+        // Action::Ignore on a tracked glob-like path must pass :(literal) to `git rm --cached`.
+        f.tab.apply(
+            Action::Ignore {
+                pattern: "glob[1].txt".to_owned(),
+                path: "glob[1].txt".to_owned(),
+            },
+            &f.ctx,
+        );
+        match &f.tab.dialog {
+            Some(Dialog::Confirm { ops, .. }) => {
+                assert_eq!(
+                    ops.first().and_then(|v| v.last()).map(String::as_str),
+                    Some(":(literal)glob[1].txt")
+                );
+            }
+            _ => unreachable!("expected stop-tracking confirm dialog"),
+        }
+        f.tab.dialog = None;
+
+        // Re-selecting the same commit clears Compare/FileView/Rebase overlays.
+        f.tab.select_hash(&head, &f.ctx);
+        f.pump();
+        f.run(Action::Compare {
+            base: head.clone(),
+            base_label: "HEAD".to_owned(),
+            target: None,
+            target_label: "working tree".to_owned(),
+            since_fork: false,
+        });
+        assert!(f.tab.compare.is_some());
+        f.tab.select_hash(&head, &f.ctx);
+        assert!(f.tab.compare.is_none());
+    }
+
+    #[test]
+    fn amend_is_ignored_during_merge_and_esc_while_typing_keeps_conflict_open() {
+        use super::test_support::*;
+        use super::{Action, DiffKey};
+
+        let dir = repo("mod-amend-esc");
+        write(&dir, "f.txt", "base\n");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+        git(&dir, &["checkout", "-q", "-b", "side"]);
+        write(&dir, "f.txt", "side\n");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "side"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        write(&dir, "f.txt", "main\n");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "main"]);
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["merge", "--no-commit", "side"])
+            .output();
+
+        let mut f = Fixture::open(&dir);
+        assert!(f.tab.work.in_progress.is_some());
+        // Simulate amend previously checked before merge started.
+        f.tab.amend = true;
+        f.tab.commit_summary = "Merge side".to_owned();
+        // Open ConflictEditor, focus its RESULT TextEdit, press Esc, and verify ConflictEditor stays open.
+        if let Some(cf) = f.tab.work.conflicted.first().cloned() {
+            use egui_kittest::kittest::Queryable;
+
+            f.tab.apply(Action::OpenDiff(DiffKey::Work(cf)), &f.ctx);
+            assert!(f.tab.conflict.is_some());
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size([900.0, 600.0])
+                .build_ui(|ui| {
+                    if ui.ctx().cumulative_frame_nr() == 0 {
+                        crate::theme::install_fonts(ui.ctx());
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    f.tab.ui(ui);
+                });
+            harness.run();
+            let result_box = harness
+                .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+                .next();
+            assert!(result_box.is_some(), "expected ConflictEditor RESULT TextEdit");
+            if let Some(node) = result_box {
+                node.click();
+            }
+            harness.run();
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            drop(harness);
+            assert!(
+                f.tab.conflict.is_some(),
+                "Esc while unfocusing a TextEdit must not discard ConflictEditor"
+            );
+            assert!(
+                !f.tab.amend,
+                "amend flag must clear while a merge/rebase is in progress"
+            );
+        }
     }
 }

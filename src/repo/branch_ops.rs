@@ -1,13 +1,14 @@
 //! Dialogs for merging (fast-forward, squash, no-commit, message), stashing (only the selected
 //! files, keep the index) and for a checkout that local changes block (stash, switch, reapply).
 
-use egui::{RichText, Ui};
+use egui::{Align2, Key, Rect, RichText, Sense, Ui, pos2, vec2};
 
-use super::dialogs::{Outcome, buttons, title};
+use super::dialogs::{Outcome, buttons, title, valid_ref_name};
 use super::ext::{DialogBody, dialog};
-use super::sync::{pick, row};
+use super::sync::{matches_branch_filter, pick, row};
 use super::{Action, Dialog, Refresh, RepoTab, Undo, ops, widgets};
-use crate::theme::Tokens;
+use crate::git::Branch;
+use crate::theme::{self, Tokens};
 
 // ---- merge ----------------------------------------------------------------------------------
 
@@ -434,6 +435,529 @@ impl DialogBody for BlockedCheckout {
             }
         });
         outcome
+    }
+}
+
+// ---- track / untrack ------------------------------------------------------------------------
+
+/// Sets `local`'s upstream to `upstream`, undoable back to its previous upstream (or untracked).
+pub(super) fn track_action(
+    local: &str,
+    upstream: &str,
+    prev_upstream: Option<&str>,
+    prev_gone: bool,
+) -> Action {
+    let set_cmd = vec![
+        "branch".to_owned(),
+        format!("--set-upstream-to={upstream}"),
+        local.to_owned(),
+    ];
+    let undo_cmd = match prev_upstream.filter(|p| !p.is_empty() && !prev_gone) {
+        Some(prev) => vec![
+            "branch".to_owned(),
+            format!("--set-upstream-to={prev}"),
+            local.to_owned(),
+        ],
+        None => vec![
+            "branch".to_owned(),
+            "--unset-upstream".to_owned(),
+            local.to_owned(),
+        ],
+    };
+    Action::UndoableOps {
+        label: format!("Track {upstream} on {local}"),
+        ops: vec![set_cmd.clone()],
+        refresh: Refresh::All,
+        undo: Undo::Custom {
+            undo: vec![undo_cmd],
+            redo: vec![set_cmd],
+        },
+    }
+}
+
+/// Removes upstream tracking from `local` (`--unset-upstream`), undoable unless upstream is gone.
+pub(super) fn untrack_action(local: &str, prev_upstream: &str, prev_gone: bool) -> Action {
+    let unset_cmd = vec![
+        "branch".to_owned(),
+        "--unset-upstream".to_owned(),
+        local.to_owned(),
+    ];
+    if !prev_upstream.is_empty() && !prev_gone {
+        Action::UndoableOps {
+            label: format!("Untrack {local}"),
+            ops: vec![unset_cmd.clone()],
+            refresh: Refresh::All,
+            undo: Undo::Custom {
+                undo: vec![vec![
+                    "branch".to_owned(),
+                    format!("--set-upstream-to={prev_upstream}"),
+                    local.to_owned(),
+                ]],
+                redo: vec![unset_cmd],
+            },
+        }
+    } else {
+        Action::Ops {
+            label: format!("Untrack {local}"),
+            ops: vec![unset_cmd],
+            refresh: Refresh::All,
+        }
+    }
+}
+
+enum TrackMode {
+    /// Picking a remote branch to track for `local`.
+    ForLocal {
+        local: String,
+        current_upstream: String,
+        current_gone: bool,
+        remotes: Vec<String>,
+    },
+    /// Picking a local branch to track `remote_branch`.
+    ForRemote {
+        remote_branch: String,
+        /// `(local_name, current_upstream, upstream_gone)`.
+        locals: Vec<(String, String, bool)>,
+    },
+}
+
+struct TrackBranchDialog {
+    mode: TrackMode,
+    query: String,
+    selected: Option<usize>,
+    focus: bool,
+}
+
+impl TrackBranchDialog {
+    fn item_count(&self) -> usize {
+        match &self.mode {
+            TrackMode::ForLocal { remotes, .. } => remotes.len(),
+            TrackMode::ForRemote { locals, .. } => locals.len(),
+        }
+    }
+
+    fn item_name(&self, idx: usize) -> Option<&str> {
+        match &self.mode {
+            TrackMode::ForLocal { remotes, .. } => remotes.get(idx).map(String::as_str),
+            TrackMode::ForRemote { locals, .. } => locals.get(idx).map(|(n, _, _)| n.as_str()),
+        }
+    }
+
+    fn track_selected_action(&self) -> Option<Action> {
+        let idx = self.selected?;
+        match &self.mode {
+            TrackMode::ForLocal {
+                local,
+                current_upstream,
+                current_gone,
+                remotes,
+            } => {
+                let remote = remotes.get(idx)?;
+                if !valid_ref_name(local)
+                    || !valid_ref_name(remote)
+                    || (remote == current_upstream && !*current_gone)
+                {
+                    return None;
+                }
+                let prev = (!current_upstream.is_empty()).then_some(current_upstream.as_str());
+                Some(track_action(local, remote, prev, *current_gone))
+            }
+            TrackMode::ForRemote {
+                remote_branch,
+                locals,
+            } => {
+                let (local, cur_up, cur_gone) = locals.get(idx)?;
+                if !valid_ref_name(local)
+                    || !valid_ref_name(remote_branch)
+                    || (cur_up == remote_branch && !*cur_gone)
+                {
+                    return None;
+                }
+                let prev = (!cur_up.is_empty()).then_some(cur_up.as_str());
+                Some(track_action(local, remote_branch, prev, *cur_gone))
+            }
+        }
+    }
+
+    fn untrack_selected_action(&self) -> Option<Action> {
+        match &self.mode {
+            TrackMode::ForLocal {
+                local,
+                current_upstream,
+                current_gone,
+                ..
+            } => (!current_upstream.is_empty())
+                .then(|| untrack_action(local, current_upstream, *current_gone)),
+            TrackMode::ForRemote {
+                remote_branch,
+                locals,
+            } => {
+                let idx = self.selected?;
+                let (local, cur_up, cur_gone) = locals.get(idx)?;
+                (cur_up == remote_branch).then(|| untrack_action(local, cur_up, *cur_gone))
+            }
+        }
+    }
+}
+
+impl DialogBody for TrackBranchDialog {
+    fn ui(&mut self, ui: &mut Ui, t: &Tokens, enter: bool) -> Outcome {
+        match &self.mode {
+            TrackMode::ForLocal {
+                local,
+                current_upstream,
+                current_gone,
+                ..
+            } => {
+                let sub = if current_upstream.is_empty() {
+                    format!("Choose a remote branch for “{local}” to track.")
+                } else if *current_gone {
+                    format!(
+                        "Currently tracks {current_upstream} (deleted on remote). Pick a replacement or untrack."
+                    )
+                } else {
+                    format!("Currently tracks {current_upstream}.")
+                };
+                title(ui, "Track remote branch", &sub, t);
+            }
+            TrackMode::ForRemote { remote_branch, .. } => {
+                title(
+                    ui,
+                    "Track with local branch",
+                    &format!("Choose a local branch to track “{remote_branch}”."),
+                    t,
+                );
+            }
+        }
+
+        let hint = match &self.mode {
+            TrackMode::ForLocal { .. } => "Search remote branches…",
+            TrackMode::ForRemote { .. } => "Search local branches…",
+        };
+        ui.horizontal(|ui| {
+            let clear_w = if self.query.is_empty() { 0.0 } else { 26.0 };
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .hint_text(hint)
+                    .desired_width((ui.available_width() - clear_w).max(80.0))
+                    .margin(egui::Margin::symmetric(8, 5)),
+            );
+            if self.focus {
+                edit.request_focus();
+                self.focus = false;
+            }
+            if !self.query.is_empty() && ui.small_button("×").clicked() {
+                self.query.clear();
+                edit.request_focus();
+            }
+        });
+        ui.add_space(6.0);
+
+        let total = self.item_count();
+        let filtered: Vec<usize> = (0..total)
+            .filter(|&i| {
+                self.item_name(i)
+                    .is_some_and(|name| matches_branch_filter(name, &self.query))
+            })
+            .collect();
+
+        let mut moved = false;
+        if filtered.is_empty() {
+            self.selected = None;
+        } else {
+            let pos = self
+                .selected
+                .and_then(|sel| filtered.iter().position(|&i| i == sel))
+                .unwrap_or(0);
+            let (down, up) = ui.input(|i| (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp)));
+            moved = down || up;
+            let next_pos = if down {
+                (pos + 1).min(filtered.len() - 1)
+            } else if up {
+                pos.saturating_sub(1)
+            } else {
+                pos
+            };
+            self.selected = Some(filtered[next_pos]);
+        }
+
+        let mut outcome = Outcome::Open;
+        if total == 0 {
+            let msg = match &self.mode {
+                TrackMode::ForLocal { .. } => "No remote branches available",
+                TrackMode::ForRemote { .. } => "No local branches available",
+            };
+            ui.label(RichText::new(msg).color(t.text_faint));
+        } else if filtered.is_empty() {
+            ui.label(RichText::new("No matching branches").color(t.text_faint));
+        } else {
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                egui::ScrollArea::vertical()
+                    .id_salt("track-branch-rows")
+                    .max_height(240.0)
+                    .auto_shrink([false, true])
+                    .show_rows(ui, 24.0, filtered.len(), |ui, range| {
+                        for row_idx in range {
+                            let Some(&orig_idx) = filtered.get(row_idx) else {
+                                continue;
+                            };
+                            let Some(name) = self.item_name(orig_idx) else {
+                                continue;
+                            };
+                            let name = name.to_owned();
+                            let tag = match &self.mode {
+                                TrackMode::ForLocal {
+                                    current_upstream,
+                                    current_gone,
+                                    ..
+                                } => (name == *current_upstream && !*current_gone)
+                                    .then(|| ("current".to_owned(), t.accent)),
+                                TrackMode::ForRemote {
+                                    remote_branch,
+                                    locals,
+                                } => locals.get(orig_idx).and_then(|(_, cur_up, cur_gone)| {
+                                    if cur_up == remote_branch && !*cur_gone {
+                                        Some(("tracks this".to_owned(), t.accent))
+                                    } else if !cur_up.is_empty() {
+                                        let label = if *cur_gone {
+                                            format!("{cur_up} (gone)")
+                                        } else {
+                                            cur_up.clone()
+                                        };
+                                        Some((label, t.text_faint))
+                                    } else {
+                                        None
+                                    }
+                                }),
+                            };
+                            let is_selected = self.selected == Some(orig_idx);
+                            let (rect, resp) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 24.0),
+                                Sense::click(),
+                            );
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::SelectableLabel,
+                                    true,
+                                    &name,
+                                )
+                            });
+                            let p = ui.painter_at(rect);
+                            if is_selected {
+                                p.rect_filled(rect, 3.0, t.row_selected);
+                            } else if resp.hovered() {
+                                p.rect_filled(rect, 3.0, t.hover);
+                            }
+                            let y = rect.center().y;
+                            let mut text_right = rect.right() - 8.0;
+                            if let Some((tag_text, tag_color)) = &tag {
+                                let r = p.text(
+                                    pos2(text_right, y),
+                                    Align2::RIGHT_CENTER,
+                                    tag_text,
+                                    theme::medium(11.0),
+                                    *tag_color,
+                                );
+                                text_right = (r.left() - 8.0).max(rect.left() + 8.0);
+                            }
+                            p.with_clip_rect(Rect::from_min_max(
+                                pos2(rect.left() + 8.0, rect.top()),
+                                pos2(text_right, rect.bottom()),
+                            ))
+                            .text(
+                                pos2(rect.left() + 8.0, y),
+                                Align2::LEFT_CENTER,
+                                &name,
+                                theme::mono(12.0),
+                                t.text,
+                            );
+                            let tip = match &tag {
+                                Some((tag_text, _)) => format!("{name}\n{tag_text}"),
+                                None => name.clone(),
+                            };
+                            let resp = resp.on_hover_text(tip);
+                            if moved && is_selected {
+                                resp.scroll_to_me(None);
+                            }
+                            if resp.clicked() {
+                                self.selected = Some(orig_idx);
+                            }
+                            if resp.double_clicked() {
+                                self.selected = Some(orig_idx);
+                                if let Some(act) = self.track_selected_action() {
+                                    outcome = Outcome::Done(act);
+                                }
+                            }
+                        }
+                    });
+            });
+        }
+
+        ui.add_space(10.0);
+        let track_act = self.track_selected_action();
+        let untrack_act = self.untrack_selected_action();
+        ui.horizontal_wrapped(|ui| {
+            let clicked_track =
+                widgets::primary_button(ui, "Track", track_act.is_some(), 90.0).clicked();
+            if (clicked_track || enter)
+                && let Some(act) = track_act
+            {
+                outcome = Outcome::Done(act);
+            }
+            if let Some(act) = untrack_act
+                && ui
+                    .add(egui::Button::new("Untrack").min_size(vec2(80.0, 30.0)))
+                    .clicked()
+            {
+                outcome = Outcome::Done(act);
+            }
+            if ui
+                .add(egui::Button::new("Cancel").min_size(vec2(80.0, 30.0)))
+                .clicked()
+            {
+                outcome = Outcome::Cancel;
+            }
+        });
+        outcome
+    }
+}
+
+impl RepoTab {
+    /// Opens a searchable dialog picking which remote branch `b` should track (or untrack).
+    pub(super) fn track_remote_dialog(&self, b: &Branch) -> Dialog {
+        let mut remotes: Vec<String> = self
+            .refs
+            .remotes
+            .iter()
+            .flat_map(|(_, list)| list.iter())
+            .filter(|r| !r.name.ends_with("/HEAD"))
+            .map(|r| r.name.clone())
+            .collect();
+        remotes.sort();
+        remotes.dedup();
+        let same_name = format!("/{}", b.name);
+        let selected = (!b.upstream.is_empty() && !b.upstream_gone())
+            .then(|| remotes.iter().position(|r| r == &b.upstream))
+            .flatten()
+            .or_else(|| remotes.iter().position(|r| r.ends_with(&same_name)))
+            .or_else(|| (!remotes.is_empty()).then_some(0));
+        dialog(TrackBranchDialog {
+            mode: TrackMode::ForLocal {
+                local: b.name.clone(),
+                current_upstream: b.upstream.clone(),
+                current_gone: b.upstream_gone(),
+                remotes,
+            },
+            query: String::new(),
+            selected,
+            focus: true,
+        })
+    }
+
+    /// Opens a searchable dialog picking which local branch should track `remote_branch`.
+    pub(super) fn track_local_dialog(&self, remote_branch: &str) -> Dialog {
+        let locals: Vec<(String, String, bool)> = self
+            .refs
+            .local
+            .iter()
+            .map(|b| (b.name.clone(), b.upstream.clone(), b.upstream_gone()))
+            .collect();
+        let short = remote_branch
+            .split_once('/')
+            .map_or(remote_branch, |(_, s)| s);
+        let selected = self
+            .refs
+            .current
+            .as_deref()
+            .and_then(|cur| locals.iter().position(|(n, _, _)| n == cur))
+            .or_else(|| locals.iter().position(|(n, _, _)| n == short))
+            .or_else(|| (!locals.is_empty()).then_some(0));
+        dialog(TrackBranchDialog {
+            mode: TrackMode::ForRemote {
+                remote_branch: remote_branch.to_owned(),
+                locals,
+            },
+            query: String::new(),
+            selected,
+            focus: true,
+        })
+    }
+
+    /// Context-menu items to track or untrack a remote branch from local branches.
+    pub(super) fn remote_branch_track_menu_items(
+        &self,
+        ui: &mut Ui,
+        acts: &mut Vec<Action>,
+        remote_branch: &str,
+        current: Option<&str>,
+        idle: bool,
+    ) {
+        if remote_branch.ends_with("/HEAD") {
+            return;
+        }
+        if let Some(cur) = current
+            && let Some(cur_branch) = self.refs.local.iter().find(|b| b.name == cur)
+        {
+            if cur_branch.upstream == remote_branch && !cur_branch.upstream_gone() {
+                if ui
+                    .add_enabled(idle, egui::Button::new(format!("Untrack from {cur}")))
+                    .clicked()
+                {
+                    acts.push(untrack_action(cur, &cur_branch.upstream, false));
+                }
+            } else if ui
+                .add_enabled(idle, egui::Button::new(format!("Track with {cur}")))
+                .clicked()
+            {
+                let prev = (!cur_branch.upstream.is_empty()).then_some(cur_branch.upstream.as_str());
+                acts.push(track_action(
+                    cur,
+                    remote_branch,
+                    prev,
+                    cur_branch.upstream_gone(),
+                ));
+            }
+        }
+        let track_local_btn = ui.add_enabled(
+            idle && !self.refs.local.is_empty(),
+            egui::Button::new("Track with local branch…"),
+        );
+        let track_local_btn = if self.refs.local.is_empty() {
+            track_local_btn.on_disabled_hover_text("No local branches")
+        } else {
+            track_local_btn
+        };
+        if track_local_btn.clicked() {
+            acts.push(Action::Dialog(self.track_local_dialog(remote_branch)));
+        }
+        let others: Vec<&Branch> = self
+            .refs
+            .local
+            .iter()
+            .filter(|b| {
+                Some(b.name.as_str()) != current && b.upstream == remote_branch && !b.upstream_gone()
+            })
+            .collect();
+        if others.len() == 1 {
+            let b = others[0];
+            if ui
+                .add_enabled(idle, egui::Button::new(format!("Untrack from {}", b.name)))
+                .clicked()
+            {
+                acts.push(untrack_action(&b.name, &b.upstream, false));
+            }
+        } else if others.len() > 1 {
+            ui.add_enabled_ui(idle, |ui| {
+                ui.menu_button("Untrack from", |ui| {
+                    for b in &others {
+                        if ui.button(&b.name).clicked() {
+                            acts.push(untrack_action(&b.name, &b.upstream, false));
+                        }
+                    }
+                });
+            });
+        }
     }
 }
 
@@ -1242,5 +1766,154 @@ mod review_tests {
             rem.force_checkout_ops(),
             ops(&[&["checkout", "--force", "--track", "origin/feat"]])
         );
+    }
+
+    #[test]
+    fn track_and_untrack_branch_round_trip_with_undo() {
+        let (work, _bare) = repo_with_remote("rv-track-untrack");
+        git(&work, &["push", "-q", "origin", "HEAD:refs/heads/topic-a"]);
+        git(&work, &["push", "-q", "origin", "HEAD:refs/heads/topic-b"]);
+        git(&work, &["fetch", "-q", "--prune"]);
+        git(&work, &["branch", "feat"]);
+
+        let mut f = Fixture::open(&work);
+        let upstream_of = |f: &Fixture, name: &str| {
+            f.tab
+                .refs
+                .local
+                .iter()
+                .find(|b| b.name == name)
+                .map(|b| (b.upstream.clone(), b.upstream_gone()))
+        };
+        assert_eq!(upstream_of(&f, "feat"), Some((String::new(), false)));
+
+        // Track an untracked branch and verify undo / redo.
+        f.run(track_action("feat", "origin/topic-a", None, false));
+        assert!(!f.failed(), "{:?}", f.status());
+        assert_eq!(
+            upstream_of(&f, "feat"),
+            Some(("origin/topic-a".to_owned(), false))
+        );
+        f.run(Action::Undo);
+        assert_eq!(upstream_of(&f, "feat"), Some((String::new(), false)));
+        f.run(Action::Redo);
+        assert_eq!(
+            upstream_of(&f, "feat"),
+            Some(("origin/topic-a".to_owned(), false))
+        );
+
+        // Switch tracked upstream and undo back to previous remote branch.
+        f.run(track_action(
+            "feat",
+            "origin/topic-b",
+            Some("origin/topic-a"),
+            false,
+        ));
+        assert_eq!(
+            upstream_of(&f, "feat"),
+            Some(("origin/topic-b".to_owned(), false))
+        );
+        f.run(Action::Undo);
+        assert_eq!(
+            upstream_of(&f, "feat"),
+            Some(("origin/topic-a".to_owned(), false))
+        );
+
+        // Untrack live upstream and undo back.
+        f.run(untrack_action("feat", "origin/topic-a", false));
+        assert_eq!(upstream_of(&f, "feat"), Some((String::new(), false)));
+        f.run(Action::Undo);
+        assert_eq!(
+            upstream_of(&f, "feat"),
+            Some(("origin/topic-a".to_owned(), false))
+        );
+
+        // Delete remote branch so upstream becomes [gone], then untrack cleanly.
+        git(&work, &["push", "-q", "origin", "--delete", "topic-a"]);
+        git(&work, &["fetch", "-q", "--prune"]);
+        f.reload();
+        assert_eq!(
+            upstream_of(&f, "feat"),
+            Some(("origin/topic-a".to_owned(), true))
+        );
+        f.run(untrack_action("feat", "origin/topic-a", true));
+        assert!(!f.failed(), "{:?}", f.status());
+        assert_eq!(upstream_of(&f, "feat"), Some((String::new(), false)));
+    }
+
+    #[test]
+    fn track_dialog_excludes_head_and_filters_across_viewports() {
+        use egui_kittest::kittest::Queryable;
+
+        let (work, _bare) = repo_with_remote("rv-track-dialog");
+        git(&work, &["push", "-q", "origin", "HEAD:refs/heads/alpha-feat"]);
+        git(&work, &["push", "-q", "origin", "HEAD:refs/heads/beta-fix"]);
+        git(&work, &["remote", "set-head", "origin", "main"]);
+        git(&work, &["fetch", "-q", "--prune"]);
+        let f = Fixture::open(&work);
+        let main_branch = f.tab.refs.local.iter().find(|b| b.name == "main").cloned();
+        assert!(main_branch.is_some());
+        if let Some(b) = main_branch {
+            let picked = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+            for size in [[640.0, 480.0], [280.0, 360.0]] {
+                let Dialog::Ext(body) = f.tab.track_remote_dialog(&b) else {
+                    unreachable!("track dialog should be Dialog::Ext")
+                };
+                let s = std::rc::Rc::new(std::cell::RefCell::new(body));
+                let p = picked.clone();
+                let mut harness = egui_kittest::Harness::builder()
+                    .with_size(size)
+                    .build_ui(move |ui| {
+                        if ui.ctx().cumulative_frame_nr() == 0 {
+                            crate::theme::install_fonts(ui.ctx());
+                            ui.ctx().request_repaint();
+                            return;
+                        }
+                        let t = Tokens::get(ui.ctx());
+                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                        if let Outcome::Done(Action::UndoableOps { label, .. }) =
+                            s.borrow_mut().ui(ui, &t, enter)
+                        {
+                            *p.borrow_mut() = Some(label);
+                        }
+                    });
+                harness.run();
+                harness.step();
+                assert!(harness.query_by_label("origin/HEAD").is_none());
+                assert!(harness.query_by_label("origin/alpha-feat").is_some());
+                if size[0] > 400.0 {
+                    harness.event(egui::Event::Text("beta".to_owned()));
+                    harness.run();
+                    assert!(harness.query_by_label("origin/alpha-feat").is_none());
+                    assert!(harness.query_by_label("origin/beta-fix").is_some());
+                    harness.key_press(Key::Enter);
+                    harness.run();
+                }
+            }
+            assert_eq!(
+                picked.borrow().as_deref(),
+                Some("Track origin/beta-fix on main")
+            );
+        }
+
+        // Also render `ForRemote` mode across both viewports to verify zero panics.
+        for size in [[280.0, 360.0], [640.0, 480.0]] {
+            let Dialog::Ext(remote_body) = f.tab.track_local_dialog("origin/beta-fix") else {
+                unreachable!("track local dialog should be Dialog::Ext")
+            };
+            let s = std::rc::Rc::new(std::cell::RefCell::new(remote_body));
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(size)
+                .build_ui(move |ui| {
+                    if ui.ctx().cumulative_frame_nr() == 0 {
+                        crate::theme::install_fonts(ui.ctx());
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    let t = Tokens::get(ui.ctx());
+                    let _ = s.borrow_mut().ui(ui, &t, false);
+                });
+            harness.run();
+        }
     }
 }

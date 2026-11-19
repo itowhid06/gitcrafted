@@ -453,27 +453,24 @@ impl RepoTab {
                             .map(|b| b.name.as_str())
                             .filter(|n| !busy.contains(n))
                             .collect();
-                        egui::ComboBox::from_id_salt("worktree-branch")
-                            .width(ui.available_width())
-                            .selected_text(if branch.is_empty() {
-                                "Choose a branch"
-                            } else {
-                                branch.as_str()
-                            })
-                            .show_ui(ui, |ui| {
-                                for name in &free {
-                                    if ui.selectable_label(branch == name, *name).clicked() {
-                                        *branch = (*name).to_owned();
-                                        changed = true;
-                                    }
-                                }
-                                if free.is_empty() {
-                                    ui.label(
-                                        RichText::new("Every branch is checked out somewhere")
-                                            .color(t.text_faint),
-                                    );
-                                }
-                            });
+                        let selected_idx = free.iter().position(|&n| n == branch.as_str());
+                        let selected_text = if branch.is_empty() {
+                            "Choose a branch".to_owned()
+                        } else {
+                            branch.clone()
+                        };
+                        if super::sync::pick_searchable(
+                            ui,
+                            "worktree-branch",
+                            &selected_text,
+                            &free,
+                            selected_idx,
+                            "Every branch is checked out somewhere",
+                            "Search branches…",
+                            |_, name| *branch = name.to_owned(),
+                        ) {
+                            changed = true;
+                        }
                     }
                     ui.add_space(8.0);
                     ui.label(RichText::new("Folder").color(t.text_dim).small());
@@ -653,9 +650,39 @@ impl RepoTab {
                         }
                     })
                 }
-                Dialog::Sync(sync) => sync.ui(ui, &t, enter),
-                Dialog::Apply(apply) => apply.ui(ui, &t, enter),
-                Dialog::Ext(body) => body.ui(ui, &t, enter),
+                Dialog::Sync(sync) => {
+                    if !idle {
+                        ui.label(
+                            RichText::new("Wait for the running operation to finish…")
+                                .color(t.warning)
+                                .small(),
+                        );
+                        ui.add_space(4.0);
+                    }
+                    sync.ui(ui, &t, enter)
+                }
+                Dialog::Apply(apply) => {
+                    if !idle {
+                        ui.label(
+                            RichText::new("Wait for the running operation to finish…")
+                                .color(t.warning)
+                                .small(),
+                        );
+                        ui.add_space(4.0);
+                    }
+                    apply.ui(ui, &t, enter)
+                }
+                Dialog::Ext(body) => {
+                    if !idle {
+                        ui.label(
+                            RichText::new("Wait for the running operation to finish…")
+                                .color(t.warning)
+                                .small(),
+                        );
+                        ui.add_space(4.0);
+                    }
+                    body.ui(ui, &t, enter)
+                }
                 Dialog::AddSubmodule { url, path, path_edited, focus } => {
                     title(ui, "Add submodule", "The repository to embed and the folder it goes in.", &t);
                     if field(ui, url, "https://github.com/user/repo.git", focus).changed() && !*path_edited {
@@ -807,17 +834,34 @@ impl RepoTab {
             }
         });
 
+        let is_credentials = matches!(dialog, Dialog::Credentials { .. });
+        let mut dismissed_credentials = false;
         match response.inner {
-            Outcome::Done(action) if idle => {
+            Outcome::Done(action)
+                if idle || matches!(action, Action::SelectHash(_) | Action::Dialog(_)) =>
+            {
                 acts.push(action);
                 self.dialog = None;
             }
-            Outcome::Done(_) => {}
-            Outcome::Cancel => self.dialog = None,
-            Outcome::Open if allow_keys && response.should_close() => self.dialog = None,
+            Outcome::Done(_) => {
+                self.status = Some(("Wait for the running operation to finish".to_owned(), true));
+            }
+            Outcome::Cancel => {
+                dismissed_credentials = is_credentials;
+                self.dialog = None;
+            }
+            Outcome::Open if allow_keys && response.should_close() => {
+                dismissed_credentials = is_credentials;
+                self.dialog = None;
+            }
             Outcome::Open => {}
             Outcome::Suggest => dialog.suggest_path(),
             Outcome::PickApplyPatch => self.pick_apply_patch(ctx),
+        }
+        if dismissed_credentials {
+            self.push_follow = super::ext::PushFollow::Idle;
+            self.pending_pr = None;
+            self.last_op = None;
         }
         if pick_worktree {
             self.pick_worktree_dir(ctx);

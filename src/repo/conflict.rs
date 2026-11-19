@@ -431,6 +431,9 @@ impl RepoTab {
                                 }
                             });
                             ui.add_space(4.0);
+                            if ui.available_width() < 24.0 {
+                                return;
+                            }
                             ui.columns(2, |cols| {
                                 for (col, (name, text, side)) in cols.iter_mut().zip([
                                     (ours_name.as_str(), ours, Choice::Ours),

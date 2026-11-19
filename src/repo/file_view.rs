@@ -216,9 +216,11 @@ impl RepoTab {
                         t.text,
                     );
                     let resp = resp.on_hover_text(
-                        "Click: this commit's changes to the file\nDouble-click: show the commit in the graph",
+                        "Click: this commit's changes to the file\nCtrl+click or right-click: show the commit in the graph",
                     );
-                    if resp.double_clicked() {
+                    let jump = (resp.clicked() && ui.input(|i| i.modifiers.command))
+                        || resp.middle_clicked();
+                    if jump {
                         acts.push(Action::CloseFileView);
                         acts.push(Action::SelectHash(c.hash.clone()));
                     } else if resp.clicked() {
@@ -227,6 +229,24 @@ impl RepoTab {
                             path: c.path.clone(),
                         }));
                     }
+                    egui::Popup::context_menu(&resp)
+                        .style(crate::theme::menu_style)
+                        .show(|ui| {
+                            if ui.button("Show changes to this file").clicked() {
+                                acts.push(Action::OpenDiff(DiffKey::Commit {
+                                    hash: c.hash.clone(),
+                                    path: c.path.clone(),
+                                }));
+                            }
+                            if ui.button("Show commit in graph").clicked() {
+                                acts.push(Action::CloseFileView);
+                                acts.push(Action::SelectHash(c.hash.clone()));
+                            }
+                            ui.separator();
+                            if ui.button("Copy commit hash").clicked() {
+                                ui.ctx().copy_text(c.hash.clone());
+                            }
+                        });
                 }
             });
     }

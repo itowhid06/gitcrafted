@@ -252,9 +252,17 @@ impl RepoTab {
     }
 
     /// The patch entries of a Changes row's right-click menu.
-    pub(super) fn patch_menu_items(&self, ui: &mut Ui, acts: &mut Vec<Action>, f: &StatusFile) {
+    pub(super) fn patch_menu_items(
+        &self,
+        ui: &mut Ui,
+        acts: &mut Vec<Action>,
+        f: &StatusFile,
+        leading_sep: bool,
+    ) {
         if f.area == Area::Conflicted {
-            ui.separator();
+            if leading_sep {
+                ui.separator();
+            }
             if ui.button("Open in external merge tool").clicked() {
                 acts.push(Action::Ext(ExtAction::MergeTool {
                     path: f.path.clone(),
@@ -264,7 +272,9 @@ impl RepoTab {
         }
         let staged = f.area == Area::Staged;
         let side = if staged { "staged" } else { "unstaged" };
-        ui.separator();
+        if leading_sep {
+            ui.separator();
+        }
         let selected = self.selected_in(staged);
         if self.is_patch_selected(f) && selected.len() > 1 {
             if ui
@@ -480,33 +490,77 @@ impl ApplyDialog {
         ui.checkbox(&mut self.reverse, "Apply in reverse (undo this patch)");
         ui.add_space(8.0);
         let file = self.file.trim().to_owned();
-        let (is_file, too_large) = if file.is_empty() {
-            (false, false)
+        let (checking, is_file, too_large) = if file.is_empty() {
+            (false, false, false)
         } else {
             const MAX_PATCH_BYTES: u64 = 50 * 1024 * 1024;
-            let stat_id = egui::Id::new(("gitcrafted-apply-stat", &self.repo));
-            let now = Instant::now();
-            let cached = ui.ctx().data(|d| {
-                d.get_temp::<(String, Instant, bool, bool)>(stat_id)
+            #[derive(Default)]
+            struct ApplyStatCache {
+                requested: String,
+                checked_at: Option<Instant>,
+                result: Option<(String, bool, bool)>,
+                pending: bool,
+            }
+            let stat_id = egui::Id::new(("gitcrafted-apply-stat-async", &self.repo));
+            let cache: std::sync::Arc<std::sync::Mutex<ApplyStatCache>> = ui.ctx().data_mut(|d| {
+                d.get_temp_mut_or_insert_with(stat_id, || {
+                    std::sync::Arc::new(std::sync::Mutex::new(ApplyStatCache::default()))
+                })
+                .clone()
             });
-            match cached {
-                Some((ref s, at, f, big))
-                    if *s == file && now.duration_since(at).as_millis() < 500 =>
-                {
-                    (f, big)
+            let now = Instant::now();
+            let (spawn_check, out) = {
+                let mut g = match cache.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let stale = g.requested != file
+                    || (!g.pending
+                        && g.checked_at
+                            .is_none_or(|at| now.duration_since(at).as_millis() >= 500));
+                if stale {
+                    g.requested = file.clone();
+                    g.pending = true;
                 }
-                _ => {
-                    let meta = std::fs::metadata(self.patch_path());
+                let out = match &g.result {
+                    Some((s, f, big)) if *s == file => (false, *f, *big),
+                    _ => (true, false, false),
+                };
+                (stale, out)
+            };
+            if spawn_check {
+                let path = self.patch_path();
+                let key = file.clone();
+                let cache2 = cache.clone();
+                let ctx2 = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let meta = std::fs::metadata(path);
                     let is_f = meta.as_ref().is_ok_and(|m| m.is_file());
                     let big = meta.as_ref().is_ok_and(|m| m.len() > MAX_PATCH_BYTES);
-                    ui.ctx()
-                        .data_mut(|d| d.insert_temp(stat_id, (file.clone(), now, is_f, big)));
-                    (is_f, big)
-                }
+                    {
+                        let mut g = match cache2.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        if g.requested == key {
+                            g.result = Some((key, is_f, big));
+                            g.checked_at = Some(Instant::now());
+                            g.pending = false;
+                        }
+                    }
+                    ctx2.request_repaint();
+                });
             }
+            out
         };
-        let valid = !file.is_empty() && is_file && !too_large;
-        if !file.is_empty() && !is_file {
+        let valid = !file.is_empty() && !checking && is_file && !too_large;
+        if !file.is_empty() && checking {
+            ui.label(
+                RichText::new("Checking file…")
+                    .color(t.text_faint)
+                    .small(),
+            );
+        } else if !file.is_empty() && !is_file {
             ui.label(
                 RichText::new("That file doesn't exist.")
                     .color(t.danger)

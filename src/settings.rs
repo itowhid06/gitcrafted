@@ -166,7 +166,7 @@ impl Settings {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.vscode_colors, "Use VS Code's colour theme");
                 if self.vscode_colors {
-                    let note = match crate::vscode_theme::current() {
+                    let note = match crate::vscode_theme::cached_or_refresh(ui.ctx()) {
                         Some(found) if found.dark == t.dark() => found.name.clone(),
                         Some(found) => format!(
                             "{} is {}: gitcrafted's colours meanwhile",

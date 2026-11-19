@@ -30,41 +30,89 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+struct CacheEntry {
+    checked_at: Instant,
+    mtimes: Vec<(PathBuf, Option<SystemTime>)>,
+    theme: Option<Arc<EditorTheme>>,
+}
+
+static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
+static REFRESHING: AtomicBool = AtomicBool::new(false);
+
+/// Non-blocking UI-thread variant of [`current`]: returns the cached theme immediately and
+/// refreshes in the background when stale (requesting a repaint when done).
+pub fn cached_or_refresh(ctx: &egui::Context) -> Option<Arc<EditorTheme>> {
+    let (cached, stale) = {
+        let cache = match CACHE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match cache.as_ref() {
+            Some(entry) => (
+                entry.theme.clone(),
+                entry.checked_at.elapsed() >= Duration::from_secs(3),
+            ),
+            None => (None, true),
+        }
+    };
+    if stale
+        && REFRESHING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = current();
+            REFRESHING.store(false, Ordering::Release);
+            ctx2.request_repaint();
+        });
+    }
+    cached
+}
+
 /// The theme selected in VS Code; `None` when VS Code isn't installed or its theme can't be
 /// found. Reloaded at most every few seconds when VS Code's settings file changes.
 pub fn current() -> Option<Arc<EditorTheme>> {
-    struct CacheEntry {
-        checked_at: Instant,
-        path: Option<PathBuf>,
-        modified: Option<SystemTime>,
-        theme: Option<Arc<EditorTheme>>,
-    }
-    static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
     static EDITORS: OnceLock<Vec<Editor>> = OnceLock::new();
 
-    let mut cache = match CACHE.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    let prev = {
+        let cache = match CACHE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(entry) = cache.as_ref() {
+            if entry.checked_at.elapsed() < Duration::from_secs(3) {
+                return entry.theme.clone();
+            }
+            Some((entry.mtimes.clone(), entry.theme.clone()))
+        } else {
+            None
+        }
     };
-    if let Some(entry) = cache.as_ref()
-        && entry.checked_at.elapsed() < Duration::from_secs(3)
-    {
-        return entry.theme.clone();
-    }
 
     let editors = EDITORS.get_or_init(installed_editors);
-    let candidate = editors.iter().find(|e| e.settings.is_file());
-    let path = candidate.map(|e| e.settings.clone());
-    let modified = path
-        .as_ref()
-        .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    let mtimes: Vec<(PathBuf, Option<SystemTime>)> = editors
+        .iter()
+        .filter(|e| e.settings.is_file())
+        .map(|e| {
+            let mtime = std::fs::metadata(&e.settings)
+                .and_then(|m| m.modified())
+                .ok();
+            (e.settings.clone(), mtime)
+        })
+        .collect();
 
-    if let Some(entry) = cache.as_mut()
-        && entry.path == path
-        && entry.modified == modified
+    if let Some((prev_mtimes, prev_theme)) = prev
+        && prev_mtimes == mtimes
     {
-        entry.checked_at = Instant::now();
-        return entry.theme.clone();
+        let mut cache = match CACHE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(entry) = cache.as_mut() {
+            entry.checked_at = Instant::now();
+        }
+        return prev_theme;
     }
 
     let theme = editors
@@ -72,10 +120,13 @@ pub fn current() -> Option<Arc<EditorTheme>> {
         .filter(|e| e.settings.is_file())
         .find_map(load)
         .map(Arc::new);
+    let mut cache = match CACHE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     *cache = Some(CacheEntry {
         checked_at: Instant::now(),
-        path,
-        modified,
+        mtimes,
         theme: theme.clone(),
     });
     theme

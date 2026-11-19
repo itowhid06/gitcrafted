@@ -275,8 +275,13 @@ impl RepoTab {
         // The branch whose pill was right-clicked, if any.
         let pill: Option<String> = resp
             .ctx
-            .data(|d| d.get_temp::<Option<String>>(pill_menu_id(&commit.hash)))
-            .flatten();
+            .data(|d| d.get_temp::<Option<String>>(pill_menu_id(&self.path, &commit.hash)))
+            .flatten()
+            .filter(|branch| {
+                badges(&commit.refs, &self.refs)
+                    .iter()
+                    .any(|b| b.kind == BadgeKind::Branch && b.git_ref() == *branch)
+            });
         egui::Popup::context_menu(resp)
             .style(crate::theme::menu_style)
             .show(|ui| self.commit_menu_items(ui, i, pill, idle, acts));
@@ -375,6 +380,24 @@ impl RepoTab {
                 ui.separator();
                 compare_items(ui, acts, branch, current);
             }
+            let is_remote = !branch.ends_with("/HEAD")
+                && !self.refs.local.iter().any(|b| &b.name == branch)
+                && self
+                    .refs
+                    .remotes
+                    .iter()
+                    .flat_map(|(_, l)| l.iter())
+                    .any(|b| &b.name == branch);
+            if is_remote {
+                ui.separator();
+                self.remote_branch_track_menu_items(
+                    ui,
+                    acts,
+                    branch,
+                    self.refs.current.as_deref(),
+                    idle,
+                );
+            }
             ui.separator();
         }
         for b in &here {
@@ -407,19 +430,13 @@ impl RepoTab {
         ui.separator();
         if let Some(compare) = self
             .selected
-            .filter(|&s| s != i)
+            .filter(|&s| s != i && !self.is_wip(s))
             .and_then(|s| self.compare_rows(s, i))
         {
             let other = self
                 .selected
                 .and_then(|s| self.commits.get(s))
-                .map(|c| {
-                    if c.hash == WIP_HASH {
-                        "the working tree".to_owned()
-                    } else {
-                        super::short(&c.hash).to_owned()
-                    }
-                })
+                .map(|c| super::short(&c.hash).to_owned())
                 .unwrap_or_default();
             if ui
                 .button(format!("Compare with {other}"))
@@ -713,7 +730,12 @@ impl RepoTab {
                         acts.push(Action::SearchStep(if shift { -1 } else { 1 }));
                         edit.request_focus();
                     }
-                    if edit.has_focus() && esc {
+                    if (edit.has_focus() || edit.lost_focus())
+                        && esc
+                        && !self.has_dialog()
+                        && !self.keys_blocked
+                        && !egui::Popup::is_any_open(ui.ctx())
+                    {
                         acts.push(Action::ToggleSearch);
                     }
                     let n = self.search.results.len();
@@ -813,6 +835,11 @@ impl RepoTab {
         // author and how long ago it was made.
         let badges = badges(&commit.refs, &self.refs);
         let mut resp = resp;
+        if resp.secondary_clicked() && badges.is_empty() {
+            ui.data_mut(|d| {
+                d.insert_temp(pill_menu_id(&self.path, &commit.hash), None::<String>);
+            });
+        }
         if let (Some(first), Some(node_x)) = (badges.first(), node_x) {
             let refs_clip = Rect::from_min_max(rect.min, pos2(gx - 4.0, bottom));
             let rp = painter.with_clip_rect(refs_clip);
@@ -840,7 +867,7 @@ impl RepoTab {
                     .pointer_interact_pos()
                     .is_some_and(|p| pill.contains(p));
                 let branch = (on_pill && first.kind == BadgeKind::Branch).then(|| first.git_ref());
-                ui.data_mut(|d| d.insert_temp(pill_menu_id(&commit.hash), branch));
+                ui.data_mut(|d| d.insert_temp(pill_menu_id(&self.path, &commit.hash), branch));
             }
             if resp.double_clicked()
                 && ui
@@ -1133,8 +1160,8 @@ enum BadgeKind {
 }
 
 /// Where a row remembers which branch pill was right-clicked, for its menu.
-fn pill_menu_id(hash: &str) -> egui::Id {
-    egui::Id::new(("pill_menu", hash))
+fn pill_menu_id(repo: &std::path::Path, hash: &str) -> egui::Id {
+    egui::Id::new(("pill_menu", repo, hash))
 }
 
 impl Badge {

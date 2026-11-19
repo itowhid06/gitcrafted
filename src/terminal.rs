@@ -322,12 +322,13 @@ impl Terminal {
             (row.min(self.size.0.saturating_sub(1)), col.min(self.size.1))
         };
         // Drag to select; right-click copies the selection (like Windows Terminal).
-        if resp.drag_started()
+        if resp.drag_started_by(egui::PointerButton::Primary)
             && let Some(p) = resp.interact_pointer_pos()
         {
             let c = cell_at(p);
             self.selection = Some((c, c));
-        } else if resp.dragged()
+            resp.request_focus();
+        } else if resp.dragged_by(egui::PointerButton::Primary)
             && let (Some(p), Some((start, _))) = (resp.interact_pointer_pos(), self.selection)
         {
             self.selection = Some((start, cell_at(p)));
@@ -362,14 +363,12 @@ impl Terminal {
 
         // Input.
         if focused {
-            let (events, app_cursor, bracketed) = {
+            let (events, shift_held, ctrl_held) =
+                ui.input(|i| (i.events.clone(), i.modifiers.shift, i.modifiers.ctrl));
+            let (app_cursor, bracketed) = {
                 let parser = lock(&self.parser);
                 let screen = parser.screen();
-                (
-                    ui.input(|i| i.events.clone()),
-                    screen.application_cursor(),
-                    screen.bracketed_paste(),
-                )
+                (screen.application_cursor(), screen.bracketed_paste())
             };
             for event in events {
                 match event {
@@ -378,14 +377,21 @@ impl Terminal {
                         let bytes = format_paste(&text, bracketed);
                         self.send(&bytes);
                     }
-                    // egui turns Ctrl+C / Ctrl+X into clipboard events: copy a selection,
-                    // otherwise on non-macOS the shell gets SIGINT.
+                    // egui turns Ctrl+C / Ctrl+Shift+C / Ctrl+X into clipboard events:
+                    // copy a selection; only plain Ctrl+C on non-macOS sends SIGINT.
                     Event::Copy => {
-                        if !self.copy_selection(ui.ctx()) && !cfg!(target_os = "macos") {
+                        if !self.copy_selection(ui.ctx())
+                            && !cfg!(target_os = "macos")
+                            && !shift_held
+                        {
                             self.send(b"\x03");
                         }
                     }
-                    Event::Cut => self.send(b"\x18"),
+                    Event::Cut => {
+                        if !cfg!(target_os = "macos") && ctrl_held && !shift_held {
+                            self.send(b"\x18");
+                        }
+                    }
                     Event::Key {
                         key,
                         pressed: true,
