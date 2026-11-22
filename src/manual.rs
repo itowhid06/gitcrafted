@@ -45,7 +45,7 @@ const FEATURES: &[(&str, &[&str])] = &[
     (
         "Changes and commits",
         &[
-            "Stage, unstage or discard whole files from the right pane.",
+            "Stage, unstage or discard whole files from the right pane. Ctrl+A selects every file of a list, Shift+click a range, Ctrl+click single files: Stage, Unstage and Discard then act on all of them.",
             "In a file's diff, stage, unstage or discard one hunk, or click the lines you want and act on only those.",
             "A diff shows only the changes or the whole file, unified or side by side, and remembers both. Drag over its lines to select text and Ctrl+C to copy it; the strip by the scrollbar marks where the changes are.",
             "Write the summary and description and commit; amend the last commit; pick the identity you commit as.",

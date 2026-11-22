@@ -1726,7 +1726,7 @@ mod review_tests {
             .iter()
             .find(|x| x.path == "a.txt")
             .cloned();
-        assert!(again.is_some_and(|x| !f.tab.patch_selected(&x)));
+        assert!(again.is_some_and(|x| !f.tab.is_patch_selected(&x)));
     }
 
     #[test]

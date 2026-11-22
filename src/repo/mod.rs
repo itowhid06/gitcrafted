@@ -19,6 +19,7 @@ mod patch;
 mod reflog;
 mod rebase;
 mod rewrite;
+mod selection;
 mod sidebar;
 #[cfg(test)]
 mod test_support;
@@ -438,6 +439,10 @@ pub(crate) enum Action {
     CompareSinceFork(bool),
     SwapCompare,
     CloseCompare,
+    /// Show the working-tree changes and commit box (even when clean).
+    ShowLocalChanges,
+    /// Clear the toolbar status/error message.
+    DismissStatus,
     /// Search commit messages, or what commits changed in files.
     SearchCode(bool),
 }
@@ -521,6 +526,11 @@ pub struct RepoTab {
     pending_edit: Option<String>,
     /// Files Ctrl+clicked in the Changes lists, to save as a patch.
     patch_sel: Vec<StatusFile>,
+    /// Where a Shift+click in the Changes lists starts from.
+    sel_anchor: Option<StatusFile>,
+    /// The Changes list last clicked (`true`: staged), which Ctrl+A selects when the pointer isn't
+    /// over one.
+    sel_staged: bool,
     /// Where a Commit & Push is: waiting for the commit, or pushing after it.
     push_follow: ext::PushFollow,
 
@@ -533,6 +543,8 @@ pub struct RepoTab {
     branch_filter: String,
     /// Jump to the changes row on the next rebuild (after an operation left conflicts).
     focus_wip: bool,
+    /// Keep the Local changes / commit panel open even when the working tree is clean.
+    show_local_changes: bool,
     last_fetch: Instant,
 
     terminals: Vec<Terminal>,
@@ -629,6 +641,8 @@ impl RepoTab {
             pending_goto: None,
             pending_edit: None,
             patch_sel: Vec::new(),
+            sel_anchor: None,
+            sel_staged: false,
             push_follow: ext::PushFollow::Idle,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -637,6 +651,7 @@ impl RepoTab {
             status: None,
             branch_filter: String::new(),
             focus_wip: false,
+            show_local_changes: false,
             last_fetch: Instant::now(),
             terminals: Vec::new(),
             active_terminal: 0,
@@ -845,6 +860,11 @@ impl RepoTab {
         });
     }
 
+    pub(super) fn showing_local_changes(&self) -> bool {
+        self.compare.is_none()
+            && (self.show_local_changes || self.selected.is_some_and(|r| self.is_wip(r)))
+    }
+
     fn is_wip(&self, row: usize) -> bool {
         self.commits.get(row).is_some_and(|c| c.hash == WIP_HASH)
     }
@@ -903,6 +923,10 @@ impl RepoTab {
 
         // Keep the selection; otherwise start on the changes, or HEAD.
         let mut keep = previous.as_ref().and_then(|h| self.index.get(h).copied());
+        if self.show_local_changes && self.index.contains_key(WIP_HASH) {
+            self.show_local_changes = false;
+            self.focus_wip = true;
+        }
         if std::mem::take(&mut self.focus_wip) && self.index.contains_key(WIP_HASH) {
             keep = None;
             self.stash_view = None;
@@ -996,6 +1020,7 @@ impl RepoTab {
         self.file_view = None;
         self.compare = None;
         self.rebase = None;
+        self.show_local_changes = false;
         if self.selected == Some(row) && self.stash_view == stash {
             if hash != WIP_HASH {
                 self.clear_diff(ctx);
@@ -1042,6 +1067,7 @@ impl RepoTab {
         };
         let hash = stash.hash.clone();
         self.stash_view = Some(i);
+        self.show_local_changes = false;
         self.selected = self.index.get(&hash).copied();
         self.scroll_to = self.selected;
         self.file_view = None;
@@ -1130,6 +1156,7 @@ impl RepoTab {
             self.clear_diff(ctx);
         }
         self.file_view = None;
+        self.show_local_changes = false;
         self.compare = Some(compare);
         self.reload_compare(ctx);
     }
@@ -2693,6 +2720,23 @@ impl RepoTab {
                     self.clear_diff(ctx);
                 }
             }
+            Action::ShowLocalChanges => {
+                self.file_view = None;
+                self.compare = None;
+                self.rebase = None;
+                self.stash_view = None;
+                if let Some(wip_row) = self.index.get(WIP_HASH).copied() {
+                    self.show_local_changes = false;
+                    self.select(wip_row, ctx);
+                    self.scroll_to = Some(wip_row);
+                } else {
+                    self.show_local_changes = true;
+                    self.clear_diff(ctx);
+                }
+            }
+            Action::DismissStatus => {
+                self.status = None;
+            }
             Action::SearchCode(on) => {
                 if self.search.code != on {
                     self.search.code = on;
@@ -2985,12 +3029,15 @@ impl RepoTab {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some((msg, is_err)) = &self.status {
+                    if icons::small_button(ui, "x", "Dismiss").clicked() {
+                        acts.push(Action::DismissStatus);
+                    }
                     let color = if *is_err { t.danger } else { t.text_dim };
                     let first_line = headline(msg);
                     ui.add(
                         egui::Label::new(egui::RichText::new(first_line).color(color)).truncate(),
                     )
-                    .on_hover_text(msg.as_str());
+                    .on_hover_text(format!("{msg}\n\nClick × to dismiss"));
                 }
                 if let Some(op) = &self.busy_op {
                     ui.label(egui::RichText::new(format!("{op}…")).color(t.text_dim));
@@ -3036,6 +3083,7 @@ impl RepoTab {
     /// What the command palette offers for this repository.
     pub(crate) fn palette_items(&self) -> Vec<(String, String, Action)> {
         let mut items: Vec<(String, String, Action)> = vec![
+            ("Local changes".into(), "view".into(), Action::ShowLocalChanges),
             ("Fetch".into(), "remote".into(), Action::Fetch),
             ("Pull".into(), "remote".into(), Action::Pull),
             ("Push".into(), "remote".into(), Action::Push),
@@ -3477,5 +3525,37 @@ error: failed to push some refs";
                 "amend flag must clear while a merge/rebase is in progress"
             );
         }
+    }
+
+    #[test]
+    fn show_local_changes_and_dismiss_status() {
+        use super::test_support::*;
+        use super::{Action, WIP_HASH};
+
+        let dir = repo("mod-local-changes");
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        let mut f = Fixture::open(&dir);
+
+        // Clean repo: ShowLocalChanges turns on the Changes view; selecting HEAD turns it off.
+        assert!(!f.tab.showing_local_changes());
+        f.tab.apply(Action::ShowLocalChanges, &f.ctx);
+        assert!(f.tab.showing_local_changes());
+        f.tab.apply(Action::SelectHash(head), &f.ctx);
+        assert!(!f.tab.showing_local_changes());
+
+        // Dirty repo: ShowLocalChanges selects the WIP row.
+        write(&dir, "dirty.txt", "changed\n");
+        f.reload();
+        f.tab.apply(Action::ShowLocalChanges, &f.ctx);
+        assert!(f.tab.showing_local_changes());
+        assert_eq!(
+            f.tab.selected.and_then(|r| f.tab.commits.get(r)).map(|c| c.hash.as_str()),
+            Some(WIP_HASH)
+        );
+
+        // DismissStatus clears toolbar errors/status.
+        f.tab.status = Some(("Fast-forward failed".to_owned(), true));
+        f.tab.apply(Action::DismissStatus, &f.ctx);
+        assert!(f.tab.status.is_none());
     }
 }

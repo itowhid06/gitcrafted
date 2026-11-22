@@ -43,6 +43,13 @@ impl RepoTab {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
 
+                self.local_changes_row(ui, acts, idle);
+                ui.add_space(4.0);
+                let (sep, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().rect_filled(sep, 0.0, t.separator);
+                ui.add_space(4.0);
+
                 let local: Vec<&Branch> = self.refs.local.iter().filter(matches).collect();
                 let (open, add) = widgets::section_with_button(
                     ui,
@@ -151,6 +158,89 @@ impl RepoTab {
                                 });
                         });
                     }
+                }
+            });
+    }
+
+    fn local_changes_row(&self, ui: &mut Ui, acts: &mut Vec<Action>, idle: bool) {
+        let t = Tokens::get(ui.ctx());
+        let active = self.showing_local_changes();
+        let count = self.work.conflicted.len() + self.work.unstaged.len() + self.work.staged.len();
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+        let painter = ui.painter();
+        if active {
+            painter.rect_filled(rect, 0.0, t.row_selected);
+            painter.rect_filled(
+                Rect::from_min_size(rect.min, vec2(3.0, ROW_H)),
+                0.0,
+                t.accent,
+            );
+        } else if resp.hovered() {
+            painter.rect_filled(rect, 0.0, t.hover);
+        }
+        let y = rect.center().y;
+        let icon_color = if !self.work.conflicted.is_empty() {
+            t.danger
+        } else if active || count > 0 {
+            t.accent
+        } else {
+            t.text_faint
+        };
+        icons::paint(
+            ui,
+            Rect::from_center_size(pos2(rect.left() + 14.0, y), vec2(15.0, 15.0)),
+            "file-diff",
+            14.0,
+            icon_color,
+        );
+        let badge = if !self.work.conflicted.is_empty() {
+            Some((count.to_string(), t.danger))
+        } else if count > 0 {
+            Some((count.to_string(), t.accent))
+        } else {
+            Some(("clean".to_owned(), t.text_faint))
+        };
+        let mut right = rect.right() - 10.0;
+        if let Some((text, color)) = badge {
+            let r = painter.text(
+                pos2(right, y),
+                Align2::RIGHT_CENTER,
+                text,
+                theme::medium(11.0),
+                color,
+            );
+            right = r.left() - 8.0;
+        }
+        let font = if active {
+            theme::medium(12.5)
+        } else {
+            egui::FontId::proportional(12.5)
+        };
+        painter
+            .with_clip_rect(Rect::from_min_max(rect.min, pos2(right, rect.bottom())))
+            .text(
+                pos2(rect.left() + 28.0, y),
+                Align2::LEFT_CENTER,
+                "Local changes",
+                font,
+                t.text,
+            );
+        let resp = resp.on_hover_text("View working tree changes and commit box");
+        if resp.clicked() {
+            acts.push(Action::ShowLocalChanges);
+        }
+        egui::Popup::context_menu(&resp)
+            .style(crate::theme::menu_style)
+            .show(|ui| {
+                if ui.button("Show local changes").clicked() {
+                    acts.push(Action::ShowLocalChanges);
+                }
+                if count > 0
+                    && ui
+                        .add_enabled(idle, egui::Button::new("Stash all changes…"))
+                        .clicked()
+                {
+                    acts.push(Action::Dialog(self.stash_dialog()));
                 }
             });
     }

@@ -1,8 +1,10 @@
 //! Right pane: the selected commit, or the working-tree changes with staging and the commit box.
 
+use std::borrow::Cow;
+
 use egui::{Align2, Key, RichText, Sense, Ui, pos2, vec2};
 
-use super::diff::unstage_args;
+use super::selection::{discard_files_dialog, stage_files, unstage_files};
 use super::widgets::{self, RowExtra};
 use super::{Action, Dialog, DiffKey, DiffView, Refresh, RepoTab, Reword, abort_action, ops};
 use crate::git::{Area, ChangedFile, StatusFile};
@@ -11,7 +13,7 @@ use crate::theme::{self, Tokens};
 
 impl RepoTab {
     pub(super) fn detail_panel(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
-        let wip = self.selected.is_some_and(|r| self.is_wip(r));
+        let wip = self.show_local_changes || self.selected.is_some_and(|r| self.is_wip(r));
         if self.compare.is_some() {
             self.compare_panel(ui, acts);
         } else if wip {
@@ -428,7 +430,8 @@ impl RepoTab {
             )
             .show(ui, |ui| self.commit_box(ui, acts));
 
-        egui::ScrollArea::vertical()
+        let mut staged_top = f32::MAX;
+        let list = egui::ScrollArea::vertical()
             .id_salt("changes_scroll")
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -468,10 +471,24 @@ impl RepoTab {
                 }
 
                 let head = self.refs.head.clone();
+                // Rows are checked against this set, not the selection list, so Ctrl+A on a
+                // thousand files stays cheap.
+                let chosen: std::collections::HashSet<(&str, Area)> = self
+                    .patch_sel
+                    .iter()
+                    .map(|s| (s.path.as_str(), s.area))
+                    .collect();
+                let picked = |f: &StatusFile| chosen.contains(&(f.path.as_str(), f.area));
                 if !self.work.conflicted.is_empty() {
-                    list_header(ui, "CONFLICTED", self.work.conflicted.len(), None);
+                    list_header(ui, "CONFLICTED", self.work.conflicted.len(), &[]);
                     for f in &self.work.conflicted {
-                        match self.work_row(ui, acts, f, &[("check", "Mark resolved (stage)")]) {
+                        match self.work_row(
+                            ui,
+                            acts,
+                            f,
+                            picked(f),
+                            &[("check", "Mark resolved (stage)")],
+                        ) {
                             RowClick::Open => acts.push(Action::OpenDiff(DiffKey::Work(f.clone()))),
                             RowClick::Button(_) => acts.push(stage_action(
                                 "Mark resolved",
@@ -483,26 +500,69 @@ impl RepoTab {
                 }
 
                 let unstaged = &self.work.unstaged;
-                if list_header(
+                let n_unstaged = unstaged.iter().filter(|f| picked(f)).count();
+                let header = if n_unstaged > 0 {
+                    vec![
+                        HeaderButton::new(
+                            format!("Stage {n_unstaged}"),
+                            format!("Stage the {n_unstaged} selected files"),
+                        ),
+                        HeaderButton::danger(
+                            format!("Discard {n_unstaged}"),
+                            format!("Discard the changes to the {n_unstaged} selected files"),
+                        ),
+                    ]
+                } else if !unstaged.is_empty() {
+                    vec![
+                        HeaderButton::new("Stage all".to_owned(), "Stage every file".to_owned()),
+                        HeaderButton::danger(
+                            "Discard all".to_owned(),
+                            "Throw away every unstaged change, and delete the new files".to_owned(),
+                        ),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                match list_header(
                     ui,
                     "UNSTAGED",
                     unstaged.len(),
-                    (!unstaged.is_empty() && idle).then_some("Stage all"),
+                    if idle { &header } else { &[] },
                 ) {
-                    acts.push(stage_action("Stage all", vec![vec!["add", "-A"]]));
+                    Some(0) if n_unstaged > 0 => {
+                        acts.push(stage_files(&self.selected_in(false)));
+                    }
+                    Some(0) => acts.push(stage_action("Stage all", vec![vec!["add", "-A"]])),
+                    Some(_) if n_unstaged > 0 => acts.push(Action::Dialog(
+                        discard_files_dialog(&self.selected_in(false), false),
+                    )),
+                    Some(_) => acts.push(Action::Dialog(discard_files_dialog(unstaged, true))),
+                    None => {}
                 }
                 for f in unstaged {
+                    let many = picked(f) && n_unstaged > 1;
+                    let discard_tip = if many {
+                        Cow::Owned(format!("Discard changes to the {n_unstaged} selected files…"))
+                    } else {
+                        Cow::Borrowed("Discard changes…")
+                    };
+                    let stage_tip = if many {
+                        Cow::Owned(format!("Stage the {n_unstaged} selected files"))
+                    } else {
+                        Cow::Borrowed("Stage")
+                    };
                     match self.work_row(
                         ui,
                         acts,
                         f,
-                        &[("undo-2", "Discard changes…"), ("plus", "Stage")],
+                        picked(f),
+                        &[("undo-2", &discard_tip), ("plus", &stage_tip)],
                     ) {
                         RowClick::Open => acts.push(Action::OpenDiff(DiffKey::Work(f.clone()))),
-                        RowClick::Button(0) => acts.push(Action::Dialog(discard_dialog(f))),
-                        RowClick::Button(_) => {
-                            acts.push(stage_action("Stage", vec![vec!["add", "--", &f.path]]))
-                        }
+                        RowClick::Button(0) => acts.push(Action::Dialog(
+                            discard_files_dialog(&self.targets_of(f), false),
+                        )),
+                        RowClick::Button(_) => acts.push(stage_files(&self.targets_of(f))),
                         RowClick::None => {}
                     }
                 }
@@ -511,27 +571,51 @@ impl RepoTab {
                 }
 
                 let staged = &self.work.staged;
+                staged_top = ui.cursor().top();
+                let n_staged = staged.iter().filter(|f| picked(f)).count();
+                let header = if n_staged > 0 {
+                    vec![HeaderButton::new(
+                        format!("Unstage {n_staged}"),
+                        format!("Unstage the {n_staged} selected files"),
+                    )]
+                } else if !staged.is_empty() {
+                    vec![HeaderButton::new(
+                        "Unstage all".to_owned(),
+                        "Unstage every file".to_owned(),
+                    )]
+                } else {
+                    Vec::new()
+                };
                 if list_header(
                     ui,
                     "STAGED",
                     staged.len(),
-                    (!staged.is_empty() && idle).then_some("Unstage all"),
-                ) {
-                    let all: Vec<&str> = if head.is_empty() {
-                        vec!["rm", "--cached", "-r", "-q", "--", "."]
+                    if idle { &header } else { &[] },
+                )
+                .is_some()
+                {
+                    if n_staged > 0 {
+                        acts.push(unstage_files(&head, &self.selected_in(true)));
                     } else {
-                        vec!["reset", "-q"]
-                    };
-                    acts.push(stage_action("Unstage all", vec![all]));
+                        let all: Vec<&str> = if head.is_empty() {
+                            vec!["rm", "--cached", "-r", "-q", "--", "."]
+                        } else {
+                            vec!["reset", "-q"]
+                        };
+                        acts.push(stage_action("Unstage all", vec![all]));
+                    }
                 }
                 for f in staged {
-                    match self.work_row(ui, acts, f, &[("minus", "Unstage")]) {
+                    let tip = if picked(f) && n_staged > 1 {
+                        Cow::Owned(format!("Unstage the {n_staged} selected files"))
+                    } else {
+                        Cow::Borrowed("Unstage")
+                    };
+                    match self.work_row(ui, acts, f, picked(f), &[("minus", &tip)]) {
                         RowClick::Open => acts.push(Action::OpenDiff(DiffKey::Work(f.clone()))),
-                        RowClick::Button(_) => acts.push(Action::Ops {
-                            label: "Unstage".to_owned(),
-                            ops: vec![unstage_args(&head, &f.path, f.old_path.as_deref())],
-                            refresh: Refresh::Status,
-                        }),
+                        RowClick::Button(_) => {
+                            acts.push(unstage_files(&head, &self.targets_of(f)));
+                        }
                         RowClick::None => {}
                     }
                 }
@@ -539,18 +623,37 @@ impl RepoTab {
                     empty_hint(ui, "Stage files to choose what goes in the commit");
                 }
             });
+
+        // Ctrl+A selects the list under the pointer, else the one last clicked.
+        let ctx = ui.ctx().clone();
+        let free = !self.has_dialog()
+            && !self.keys_blocked
+            && !egui::Popup::is_any_open(&ctx)
+            && !ctx.egui_wants_keyboard_input();
+        if free && ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::A))
+        {
+            let staged = match ctx.pointer_hover_pos() {
+                Some(p) if list.inner_rect.contains(p) => p.y >= staged_top,
+                _ => self.sel_staged,
+            };
+            if !self.side(staged).is_empty() {
+                acts.push(Action::Patch(super::patch::PatchAction::SelectAll(staged)));
+            }
+        }
     }
 
-    /// One working-tree file with hover buttons (hidden while an operation runs).
+    /// One working-tree file with hover buttons (hidden while an operation runs). `picked`: it is
+    /// in the multi-file selection.
     fn work_row(
         &self,
         ui: &mut Ui,
         acts: &mut Vec<Action>,
         f: &StatusFile,
+        picked: bool,
         buttons: &[(&str, &str)],
     ) -> RowClick {
         let key = DiffKey::Work(f.clone());
-        let selected = self.open_key() == Some(&key) || self.patch_selected(f);
+        let selected = self.open_key() == Some(&key) || picked;
         let buttons = if self.busy_op.is_none() { buttons } else { &[] };
         let r = widgets::file_row(
             ui,
@@ -560,26 +663,88 @@ impl RepoTab {
             selected,
             RowExtra::Buttons(buttons),
         );
+        let menu = |ui: &mut Ui, acts: &mut Vec<Action>, leading_sep: bool| {
+            self.stage_menu_items(ui, acts, f);
+            self.patch_menu_items(ui, acts, f, leading_sep);
+        };
         if f.code != 'D' {
             widgets::file_menu_with(&r.row, &f.path, None, true, acts, |ui, acts| {
-                self.patch_menu_items(ui, acts, f, true)
+                ui.separator();
+                menu(ui, acts, false)
             });
         } else {
             // A deleted file has nothing to open, but its removal can go in a patch.
             egui::Popup::context_menu(&r.row)
                 .style(crate::theme::menu_style)
-                .show(|ui| self.patch_menu_items(ui, acts, f, false));
+                .show(|ui| menu(ui, acts, false));
         }
+        let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
         match r.button {
             Some(i) => RowClick::Button(i),
-            // Ctrl+click picks files for a patch instead of opening the diff.
-            None if r.row.clicked() && ui.input(|i| i.modifiers.command) => {
+            // Ctrl+click picks files for a patch, stash or stage instead of opening the diff.
+            None if r.row.clicked() && ctrl => {
                 acts.push(Action::Patch(super::patch::PatchAction::Toggle(f.clone())));
                 RowClick::None
             }
-            None if r.row.clicked() => RowClick::Open,
+            // Shift+click picks everything from the last clicked file to this one.
+            None if r.row.clicked() && shift && f.area != Area::Conflicted => {
+                acts.push(Action::Patch(super::patch::PatchAction::Click {
+                    file: f.clone(),
+                    shift: true,
+                }));
+                RowClick::None
+            }
+            None if r.row.clicked() => {
+                acts.push(Action::Patch(super::patch::PatchAction::Click {
+                    file: f.clone(),
+                    shift: false,
+                }));
+                RowClick::Open
+            }
             None => RowClick::None,
         }
+    }
+
+    /// Stage / Unstage / Discard in a row's right-click menu, for the whole selection when the row
+    /// is part of one.
+    fn stage_menu_items(&self, ui: &mut Ui, acts: &mut Vec<Action>, f: &StatusFile) {
+        if f.area == Area::Conflicted || self.busy_op.is_some() {
+            return;
+        }
+        let targets = self.targets_of(f);
+        let n = targets.len();
+        let of = |what: &str| {
+            if n > 1 {
+                format!("{what} {n} selected files")
+            } else {
+                what.to_owned()
+            }
+        };
+        if f.area == Area::Staged {
+            if ui.button(of("Unstage")).clicked() {
+                acts.push(unstage_files(&self.refs.head, &targets));
+                ui.close();
+            }
+        } else {
+            if ui.button(of("Stage")).clicked() {
+                acts.push(stage_files(&targets));
+                ui.close();
+            }
+            if ui
+                .button(if n > 1 {
+                    format!("Discard {n} selected files…")
+                } else if f.area == Area::Untracked {
+                    "Delete file…".to_owned()
+                } else {
+                    "Discard changes…".to_owned()
+                })
+                .clicked()
+            {
+                acts.push(Action::Dialog(discard_files_dialog(&targets, false)));
+                ui.close();
+            }
+        }
+        ui.separator();
     }
 
     fn commit_box(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
@@ -844,7 +1009,26 @@ fn files_header(ui: &mut Ui, files: &[ChangedFile], note: Option<&str>) {
 }
 
 /// A list title with a count and an optional text button on the right. Returns the click.
-fn list_header(ui: &mut Ui, title: &str, count: usize, button: Option<&str>) -> bool {
+/// A text button on the right of a list header.
+struct HeaderButton {
+    label: String,
+    tip: String,
+    danger: bool,
+}
+
+impl HeaderButton {
+    fn new(label: String, tip: String) -> Self {
+        Self { label, tip, danger: false }
+    }
+
+    fn danger(label: String, tip: String) -> Self {
+        Self { label, tip, danger: true }
+    }
+}
+
+/// A list's title and count, and `buttons` from the right edge leftwards; the index of the one
+/// clicked.
+fn list_header(ui: &mut Ui, title: &str, count: usize, buttons: &[HeaderButton]) -> Option<usize> {
     let t = Tokens::get(ui.ctx());
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
     let p = ui.painter();
@@ -864,22 +1048,32 @@ fn list_header(ui: &mut Ui, title: &str, count: usize, button: Option<&str>) -> 
         theme::medium(11.0),
         t.text_faint,
     );
-    let Some(label) = button else { return false };
-    let galley = p.layout_no_wrap(label.to_owned(), theme::medium(11.5), t.accent);
-    let b = egui::Rect::from_center_size(
-        pos2(rect.right() - 12.0 - galley.size().x / 2.0 - 6.0, y),
-        vec2(galley.size().x + 12.0, 22.0),
-    );
-    let resp = ui.interact(b, ui.id().with(("list_btn", title)), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(b, t.radius_sm, t.hover);
+    let mut clicked = None;
+    let mut right = rect.right() - 12.0;
+    for (i, button) in buttons.iter().enumerate() {
+        let color = if button.danger { t.danger } else { t.accent };
+        let galley = ui
+            .painter()
+            .layout_no_wrap(button.label.clone(), theme::medium(11.5), color);
+        let w = galley.size().x + 12.0;
+        let b = egui::Rect::from_min_size(pos2(right - w, y - 11.0), vec2(w, 22.0));
+        let resp = ui
+            .interact(b, ui.id().with(("list_btn", title, i)), Sense::click())
+            .on_hover_text(button.tip.as_str());
+        if resp.hovered() {
+            ui.painter().rect_filled(b, t.radius_sm, t.hover);
+        }
+        ui.painter().galley(
+            pos2(b.left() + 6.0, y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+        right = b.left() - 2.0;
     }
-    ui.painter().galley(
-        pos2(b.left() + 6.0, y - galley.size().y / 2.0),
-        galley,
-        t.accent,
-    );
-    resp.clicked()
+    clicked
 }
 
 fn empty_hint(ui: &mut Ui, text: &str) {

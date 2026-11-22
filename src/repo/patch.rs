@@ -33,6 +33,10 @@ pub enum PatchSource {
 pub enum PatchAction {
     /// Ctrl+click on a file of the Changes lists.
     Toggle(StatusFile),
+    /// Plain or Shift+click on a file: select just it, or the range up to it.
+    Click { file: StatusFile, shift: bool },
+    /// Ctrl+A: every file of the unstaged (`false`) or staged (`true`) list.
+    SelectAll(bool),
     ClearSelection,
     /// Ask where to save it, then write it.
     Save(PatchSource),
@@ -164,7 +168,7 @@ fn suggested_name(source: &PatchSource, branch: Option<&str>) -> String {
 // ---- the tab's side -------------------------------------------------------------------------
 
 impl RepoTab {
-    fn is_patch_selected(&self, f: &StatusFile) -> bool {
+    pub(super) fn is_patch_selected(&self, f: &StatusFile) -> bool {
         self.patch_sel
             .iter()
             .any(|s| s.path == f.path && s.area == f.area)
@@ -183,13 +187,8 @@ impl RepoTab {
         });
     }
 
-    /// Whether a Changes row is drawn as selected for a patch.
-    pub(super) fn patch_selected(&self, f: &StatusFile) -> bool {
-        self.is_patch_selected(f)
-    }
-
     /// The selected files of the staged or unstaged list, as the lists show them now.
-    fn selected_in(&self, staged: bool) -> Vec<StatusFile> {
+    pub(super) fn selected_in(&self, staged: bool) -> Vec<StatusFile> {
         let list = if staged {
             &self.work.staged
         } else {
@@ -212,9 +211,18 @@ impl RepoTab {
                     Some(i) => {
                         self.patch_sel.remove(i);
                     }
-                    None => self.patch_sel.push(file),
+                    None => self.patch_sel.push(file.clone()),
+                }
+                self.note_toggled(&file);
+            }
+            PatchAction::Click { file, shift } => {
+                if shift {
+                    self.select_range_to(&file);
+                } else {
+                    self.select_only(&file);
                 }
             }
+            PatchAction::SelectAll(staged) => self.select_all_in(staged),
             PatchAction::ClearSelection => self.patch_sel.clear(),
             PatchAction::Save(source) => self.save_patch(source, ctx),
         }
@@ -859,7 +867,7 @@ mod flow_tests {
         let mut f = Fixture::open(&dir);
         let files = f.tab.work.unstaged.clone();
         assert_eq!(files.len(), 2);
-        assert!(!f.tab.patch_selected(&files[0]));
+        assert!(!f.tab.is_patch_selected(&files[0]));
 
         f.tab
             .patch_action(PatchAction::Toggle(files[0].clone()), &f.ctx);
@@ -871,7 +879,7 @@ mod flow_tests {
         f.tab
             .patch_action(PatchAction::Toggle(files[0].clone()), &f.ctx);
         assert_eq!(f.tab.selected_in(false).len(), 1);
-        assert!(f.tab.patch_selected(&files[1]));
+        assert!(f.tab.is_patch_selected(&files[1]));
 
         f.tab.patch_action(PatchAction::ClearSelection, &f.ctx);
         assert!(f.tab.selected_in(false).is_empty());

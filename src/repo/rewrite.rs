@@ -91,6 +91,7 @@ impl RepoTab {
     pub(super) fn start_edit_message(&mut self, hash: String, ctx: &egui::Context) {
         self.pending_edit = None;
         self.compare = None;
+        self.show_local_changes = false;
         if self.detail.as_ref().is_some_and(|d| d.hash == hash) {
             self.open_message_editor();
             return;
