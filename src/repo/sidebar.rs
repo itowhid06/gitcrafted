@@ -428,6 +428,56 @@ impl RepoTab {
         format!("{shown}/{}", refs.len())
     }
 
+    /// "Fast-forward to origin/x": the branch moved up to its remote-tracking branch as last
+    /// fetched, and nothing else (see [`super::fast_forward_upstream_action`]). Disabled, saying
+    /// why, when that isn't a fast-forward.
+    fn fast_forward_upstream_item(
+        &self,
+        ui: &mut Ui,
+        acts: &mut Vec<Action>,
+        b: &Branch,
+        in_other_worktree: bool,
+        idle: bool,
+    ) {
+        if b.upstream.is_empty() {
+            return;
+        }
+        let (ahead, behind) = b.ahead_behind();
+        let problem = if b.upstream_gone() {
+            Some(format!("{} was deleted on the remote", b.upstream))
+        } else if in_other_worktree {
+            Some("It is checked out in another worktree: fast-forward it there".to_owned())
+        } else if behind == 0 {
+            Some(format!("Already up to date with {}", b.upstream))
+        } else if ahead > 0 {
+            Some(format!(
+                "It has {ahead} commit{} {} doesn't: merge or rebase instead",
+                if ahead == 1 { "" } else { "s" },
+                b.upstream
+            ))
+        } else {
+            None
+        };
+        let resp = ui
+            .add_enabled(
+                idle && problem.is_none(),
+                egui::Button::new(format!("Fast-forward to {}", b.upstream)),
+            )
+            .on_hover_text(format!(
+                "Move {} up to {} as last fetched; nothing is fetched, checked out or stashed",
+                b.name, b.upstream
+            ));
+        let resp = match &problem {
+            Some(problem) => resp.on_disabled_hover_text(problem),
+            None => resp,
+        };
+        if resp.clicked()
+            && let Some(action) = super::fast_forward_upstream_action(b)
+        {
+            acts.push(action);
+        }
+    }
+
     /// The menu of a local branch: in the sidebar and in the graph's commit menu.
     pub(super) fn branch_menu_items(
         &self,
@@ -465,6 +515,7 @@ impl RepoTab {
                 )));
             }
         }
+        self.fast_forward_upstream_item(ui, acts, b, elsewhere.is_some(), idle);
         if let Some(current) = self.refs.current.as_deref()
             && !b.is_head
         {
@@ -1478,6 +1529,7 @@ mod tests {
             target: String::new(),
             is_head,
             upstream: String::new(),
+            upstream_ref: String::new(),
             track: String::new(),
             time,
         }
@@ -1525,4 +1577,85 @@ mod tests {
         assert!(refs.local.iter().all(|b| b.time > 0), "{:?}", refs.local);
     }
 
+    /// `work` with `feat` pushed and tracked, then moved on by someone else and fetched:
+    /// `feat` is one commit behind `origin/feat`. Returns (work, the new origin/feat).
+    fn behind(name: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let (work, bare) = repo_with_remote(name);
+        git(&work, &["branch", "feat"]);
+        git(&work, &["push", "-q", "-u", "origin", "feat"]);
+        let other = clone_of(&bare, &format!("{name}-other"));
+        configure(&other);
+        git(&other, &["checkout", "-q", "feat"]);
+        let new = commit_file(&other, "b.txt", "two\n", "from someone else");
+        git(&other, &["push", "-q", "origin", "feat"]);
+        git(&work, &["fetch", "-q"]);
+        (work, other, new)
+    }
+
+    /// The local branch `name` as the tab lists it (a branch of that name with nothing in it
+    /// when it isn't listed, which the assertions after then catch).
+    fn local(f: &Fixture, name: &str) -> Branch {
+        let found = f.tab.refs.local.iter().find(|b| b.name == name).cloned();
+        assert!(found.is_some(), "{name} is not listed");
+        found.unwrap_or_else(|| branch(name, 0, false))
+    }
+
+    /// Runs the fast-forward of `name` to its upstream.
+    fn fast_forward(f: &mut Fixture, name: &str) {
+        let action = super::super::fast_forward_upstream_action(&local(f, name));
+        assert!(action.is_some(), "{name} tracks nothing");
+        if let Some(action) = action {
+            f.run(action);
+        }
+    }
+
+    #[test]
+    fn fast_forwards_another_branch_to_its_upstream_without_checking_it_out() {
+        let (work, _, new) = behind("sb-ff-other");
+        // A fetch from `.` with pruning on once deleted the branch instead of moving it.
+        git(&work, &["config", "fetch.prune", "true"]);
+        let mut f = Fixture::open(&work);
+        let main = git(&work, &["rev-parse", "main"]);
+        let was = git(&work, &["rev-parse", "feat"]);
+        assert_eq!(local(&f, "feat").ahead_behind(), (0, 1));
+        fast_forward(&mut f, "feat");
+        assert!(!f.failed(), "{:?}", f.status());
+        assert_eq!(git(&work, &["rev-parse", "feat"]), new);
+        assert_eq!(git(&work, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]), main);
+        f.run(Action::Undo);
+        assert_eq!(git(&work, &["rev-parse", "feat"]), was);
+        f.run(Action::Redo);
+        assert_eq!(git(&work, &["rev-parse", "feat"]), new);
+    }
+
+    #[test]
+    fn fast_forwards_the_checked_out_branch_to_its_upstream() {
+        let (work, _, new) = behind("sb-ff-head");
+        git(&work, &["checkout", "-q", "feat"]);
+        let mut f = Fixture::open(&work);
+        fast_forward(&mut f, "feat");
+        assert!(!f.failed(), "{:?}", f.status());
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]), new);
+        assert_eq!(read(&work, "b.txt"), "two\n");
+    }
+
+    #[test]
+    fn a_diverged_branch_is_not_moved() {
+        let (work, _, _) = behind("sb-ff-diverged");
+        git(&work, &["checkout", "-q", "feat"]);
+        let mine = commit_file(&work, "c.txt", "mine\n", "mine");
+        git(&work, &["checkout", "-q", "main"]);
+        let mut f = Fixture::open(&work);
+        assert_eq!(local(&f, "feat").ahead_behind(), (1, 1));
+        fast_forward(&mut f, "feat");
+        assert!(f.failed(), "{:?}", f.status());
+        assert_eq!(git(&work, &["rev-parse", "feat"]), mine);
+    }
+
+    #[test]
+    fn no_fast_forward_without_an_upstream() {
+        let b = branch("lonely", 1, false);
+        assert!(super::super::fast_forward_upstream_action(&b).is_none());
+    }
 }

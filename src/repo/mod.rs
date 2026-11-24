@@ -3570,6 +3570,44 @@ pub(crate) fn fast_forward_action(branch: &str, current: &str) -> Action {
     }
 }
 
+/// Fast-forwards `b` to its remote-tracking branch as it is now: nothing is fetched from the
+/// remote, checked out or stashed. The checked-out branch by `merge --ff-only`; any other by a
+/// fetch from this repository into it, which git refuses unless it is a fast-forward (and
+/// while the branch is checked out in another worktree). `None` when `b` tracks nothing.
+pub(crate) fn fast_forward_upstream_action(b: &git::Branch) -> Option<Action> {
+    if b.upstream.is_empty() || b.upstream_ref.is_empty() || b.upstream_gone() {
+        return None;
+    }
+    let label = format!("Fast-forward {} to {}", b.name, b.upstream);
+    if b.is_head {
+        return Some(Action::UndoableOps {
+            label,
+            ops: ops(&[&["merge", "--ff-only", &b.upstream_ref]]),
+            refresh: Refresh::All,
+            undo: Undo::HeadMove { mode: "--keep" },
+        });
+    }
+    // Full ref names, and no pruning, tags or submodules: with `fetch.prune` set, a fetch from
+    // `.` would otherwise delete the branch it is meant to move.
+    let run = ops(&[&[
+        "fetch",
+        "--no-prune",
+        "--no-tags",
+        "--no-recurse-submodules",
+        ".",
+        &format!("{}:refs/heads/{}", b.upstream_ref, b.name),
+    ]]);
+    Some(Action::UndoableOps {
+        label,
+        ops: run.clone(),
+        refresh: Refresh::All,
+        undo: Undo::Custom {
+            undo: ops(&[&["branch", "-f", &b.name, &b.target]]),
+            redo: run,
+        },
+    })
+}
+
 pub(crate) fn rebase_action(onto: &str, current: &str) -> Action {
     Action::UndoableOps {
         label: format!("Rebase {current} onto {onto}"),

@@ -197,6 +197,8 @@ pub struct Branch {
     pub target: String,
     pub is_head: bool,
     pub upstream: String,
+    /// The upstream's full ref name (`refs/remotes/origin/main`); empty without one.
+    pub upstream_ref: String,
     /// e.g. `[ahead 1, behind 2]`.
     pub track: String,
     /// When its commit was made (an annotated tag: when it was tagged), in Unix seconds.
@@ -269,6 +271,7 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
                 target: target.to_owned(),
                 is_head: head == "*",
                 upstream,
+                upstream_ref: upstream_full.to_owned(),
                 track: track.to_owned(),
                 time,
             };
@@ -285,6 +288,7 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
                 target: target.to_owned(),
                 is_head: head == "*",
                 upstream,
+                upstream_ref: upstream_full.to_owned(),
                 track: track.to_owned(),
                 time,
             };
@@ -299,6 +303,7 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
                 target: target.to_owned(),
                 is_head: head == "*",
                 upstream,
+                upstream_ref: upstream_full.to_owned(),
                 track: track.to_owned(),
                 time,
             };

@@ -97,14 +97,14 @@ test suite that drives real repositories to make sure none of it can lose your w
 
 **Branches, remotes, worktrees, submodules, stashes, tags** (left)
 
-- Local branches with ahead/behind; right-click: check out (or in a new worktree), fast-forward,
-  merge into / (interactively) rebase onto the current branch, push, force push (with a lease),
-  create a pull request, rename, delete…
+- Local branches with ahead/behind; right-click: check out (or in a new worktree), fast-forward
+  to its remote-tracking branch as last fetched (nothing fetched, checked out or stashed),
+  fast-forward, merge into / (interactively) rebase onto the current branch, push, force push
+  (with a lease), create a pull request, rename, delete…
 - The arrows in the pane's header sort branches and tags by name (A → Z or Z → A, `v2` before
   `v10`) or by their latest commit (newest or oldest first), optionally with the checked-out
-  branch on top.
-- The filter box above the branches has the usual right-click menu (cut, copy, paste, select
-  all, clear).
+  branch on top. The filter box above them has the usual right-click menu (cut, copy, paste,
+  select all, clear).
 - Remotes: add, edit (name and URL), fetch one, remove; their branches below each.
 - Worktrees: add (existing or new branch), open in a tab, open a terminal there, lock, remove,
   prune.
