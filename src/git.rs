@@ -224,6 +224,19 @@ impl Branch {
     pub fn upstream_gone(&self) -> bool {
         self.track == "[gone]"
     }
+
+    /// Splits `upstream` (`origin/main`, `origin/foo/bar`) into remote and branch on that remote.
+    pub fn upstream_remote_branch(&self) -> Option<(&str, &str)> {
+        if self.upstream.is_empty() {
+            return None;
+        }
+        let remote = self.upstream.split('/').next()?;
+        let branch = self.upstream.strip_prefix(&format!("{remote}/"))?;
+        if branch.is_empty() {
+            return None;
+        }
+        Some((remote, branch))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1411,6 +1424,25 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_remote_branch_splits_on_first_slash() {
+        let mut b = Branch {
+            name: "feat".to_owned(),
+            target: String::new(),
+            is_head: false,
+            upstream: "origin/release/1.2".to_owned(),
+            upstream_ref: String::new(),
+            track: String::new(),
+            time: 0,
+        };
+        assert_eq!(
+            b.upstream_remote_branch(),
+            Some(("origin", "release/1.2"))
+        );
+        b.upstream.clear();
+        assert_eq!(b.upstream_remote_branch(), None);
+    }
 
     #[test]
     fn gitignore_lines() {

@@ -540,6 +540,28 @@ struct TrackBranchDialog {
 }
 
 impl TrackBranchDialog {
+    fn selected_for_filtered(&self, filtered: &[usize]) -> Option<usize> {
+        let q = self.query.trim();
+        if q.is_empty() {
+            return filtered.first().copied();
+        }
+        if let Some(idx) = filtered.iter().copied().find(|&i| {
+            self.item_name(i)
+                .is_some_and(|name| name.eq_ignore_ascii_case(q))
+        }) {
+            return Some(idx);
+        }
+        if let Some(idx) = filtered.iter().copied().find(|&i| {
+            self.item_name(i).is_some_and(|name| {
+                name.rsplit_once('/')
+                    .is_some_and(|(_, short)| short.eq_ignore_ascii_case(q))
+            })
+        }) {
+            return Some(idx);
+        }
+        filtered.first().copied()
+    }
+
     fn item_count(&self) -> usize {
         match &self.mode {
             TrackMode::ForLocal { remotes, .. } => remotes.len(),
@@ -645,6 +667,7 @@ impl DialogBody for TrackBranchDialog {
             TrackMode::ForLocal { .. } => "Search remote branches…",
             TrackMode::ForRemote { .. } => "Search local branches…",
         };
+        let mut query_changed = false;
         ui.horizontal(|ui| {
             let clear_w = if self.query.is_empty() { 0.0 } else { 26.0 };
             let edit = ui.add(
@@ -653,12 +676,14 @@ impl DialogBody for TrackBranchDialog {
                     .desired_width((ui.available_width() - clear_w).max(80.0))
                     .margin(egui::Margin::symmetric(8, 5)),
             );
+            query_changed = edit.changed();
             if self.focus {
                 edit.request_focus();
                 self.focus = false;
             }
             if !self.query.is_empty() && ui.small_button("×").clicked() {
                 self.query.clear();
+                query_changed = true;
                 edit.request_focus();
             }
         });
@@ -676,6 +701,9 @@ impl DialogBody for TrackBranchDialog {
         if filtered.is_empty() {
             self.selected = None;
         } else {
+            if query_changed {
+                self.selected = self.selected_for_filtered(&filtered);
+            }
             let pos = self
                 .selected
                 .and_then(|sel| filtered.iter().position(|&i| i == sel))

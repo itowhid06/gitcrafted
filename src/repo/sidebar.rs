@@ -428,6 +428,32 @@ impl RepoTab {
         format!("{shown}/{}", refs.len())
     }
 
+    /// Confirm deleting local branch `b`, with optional force and deleting its live upstream.
+    pub(super) fn delete_local_branch_dialog(b: &Branch) -> Dialog {
+        let mut dlg = Dialog::confirm(
+            "Delete branch",
+            format!("Delete the local branch “{}”?", b.name),
+            "Delete",
+            ops(&[&["branch", "-d", &b.name]]),
+            Some((
+                "Force, even if it isn't merged (-D)".to_owned(),
+                ops(&[&["branch", "-D", &b.name]]),
+            )),
+        );
+        if !b.upstream_gone()
+            && let Some((remote, short)) = b.upstream_remote_branch()
+        {
+            dlg = dlg.also(
+                format!("Also delete “{short}” from {remote}"),
+                ops(&[&["push", remote, "--delete", short]]),
+            );
+        }
+        dlg.undo(Undo::Custom {
+            undo: ops(&[&["branch", &b.name, &b.target]]),
+            redo: ops(&[&["branch", "-D", &b.name]]),
+        })
+    }
+
     /// "Fast-forward to origin/x": the branch moved up to its remote-tracking branch as last
     /// fetched, and nothing else (see [`super::fast_forward_upstream_action`]). Disabled, saying
     /// why, when that isn't a fast-forward.
@@ -577,9 +603,8 @@ impl RepoTab {
             }
         }
         ui.separator();
-        let push_dest = if !b.upstream.is_empty()
-            && !b.upstream_gone()
-            && let Some((remote, rb)) = b.upstream.split_once('/')
+        let push_dest = if !b.upstream_gone()
+            && let Some((remote, rb)) = b.upstream_remote_branch()
         {
             Some((remote.to_owned(), Some(rb.to_owned())))
         } else {
@@ -694,22 +719,7 @@ impl RepoTab {
             .on_disabled_hover_text("Can't delete the checked-out branch")
             .clicked()
         {
-            acts.push(Action::Dialog(
-                Dialog::confirm(
-                    "Delete branch",
-                    format!("Delete the local branch “{}”?", b.name),
-                    "Delete",
-                    ops(&[&["branch", "-d", &b.name]]),
-                    Some((
-                        "Force, even if it isn't merged (-D)".to_owned(),
-                        ops(&[&["branch", "-D", &b.name]]),
-                    )),
-                )
-                .undo(Undo::Custom {
-                    undo: ops(&[&["branch", &b.name, &b.target]]),
-                    redo: ops(&[&["branch", "-D", &b.name]]),
-                }),
-            ));
+            acts.push(Action::Dialog(Self::delete_local_branch_dialog(b)));
         }
     }
 
@@ -1657,5 +1667,32 @@ mod tests {
     fn no_fast_forward_without_an_upstream() {
         let b = branch("lonely", 1, false);
         assert!(super::super::fast_forward_upstream_action(&b).is_none());
+    }
+
+    #[test]
+    fn delete_branch_dialog_includes_remote_only_when_upstream_is_live() {
+        use super::Dialog;
+        let mut tracked = branch("feat", 1, false);
+        tracked.upstream = "origin/topic-a".to_owned();
+        let Dialog::Confirm { also, .. } = RepoTab::delete_local_branch_dialog(&tracked) else {
+            panic!("expected confirm dialog");
+        };
+        let (label, extra) = also.as_ref().expect("tracked branch should offer remote delete");
+        assert!(label.contains("topic-a"));
+        let step = extra.first().expect("remote delete step");
+        assert_eq!(step, &["push", "origin", "--delete", "topic-a"]);
+
+        let mut gone = tracked.clone();
+        gone.track = "[gone]".to_owned();
+        let Dialog::Confirm { also, .. } = RepoTab::delete_local_branch_dialog(&gone) else {
+            panic!("expected confirm dialog");
+        };
+        assert!(also.is_none());
+
+        let lonely = branch("lonely", 1, false);
+        let Dialog::Confirm { also, .. } = RepoTab::delete_local_branch_dialog(&lonely) else {
+            panic!("expected confirm dialog");
+        };
+        assert!(also.is_none());
     }
 }

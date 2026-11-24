@@ -17,9 +17,8 @@ impl RepoTab {
         }
         let b = self.refs.local.iter().find(|b| b.name == branch);
         if let Some(b) = b
-            && !b.upstream.is_empty()
             && !b.upstream_gone()
-            && let Some((remote, name)) = b.upstream.split_once('/')
+            && let Some((remote, name)) = b.upstream_remote_branch()
             && super::dialogs::valid_ref_name(remote)
             && super::dialogs::valid_ref_name(name)
         {

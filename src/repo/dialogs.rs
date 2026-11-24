@@ -40,6 +40,9 @@ pub enum Dialog {
         /// An optional checkbox (label, ops to run instead when ticked), e.g. force delete.
         alternative: Option<(String, Vec<Vec<String>>)>,
         use_alternative: bool,
+        /// Optional checkbox (label, extra ops) run after the chosen delete ops when ticked.
+        also: Option<(String, Vec<Vec<String>>)>,
+        also_checked: bool,
         refresh: Refresh,
         undo: Undo,
     },
@@ -129,9 +132,25 @@ impl Dialog {
             ops,
             alternative,
             use_alternative: false,
+            also: None,
+            also_checked: false,
             refresh: Refresh::All,
             undo: Undo::None,
         }
+    }
+
+    /// Adds an optional second checkbox that appends more git steps when ticked.
+    pub fn also(mut self, label: String, ops: Vec<Vec<String>>) -> Self {
+        if let Dialog::Confirm {
+            also,
+            also_checked,
+            ..
+        } = &mut self
+        {
+            *also = Some((label, ops));
+            *also_checked = false;
+        }
+        self
     }
 
     /// Makes a confirmed operation undoable.
@@ -783,6 +802,8 @@ impl RepoTab {
                     ops,
                     alternative,
                     use_alternative,
+                    also,
+                    also_checked,
                     refresh,
                     undo,
                 } => {
@@ -792,6 +813,10 @@ impl RepoTab {
                     if let Some((label, _)) = alternative {
                         ui.add_space(6.0);
                         ui.checkbox(use_alternative, label.as_str());
+                    }
+                    if let Some((label, _)) = also {
+                        ui.add_space(6.0);
+                        ui.checkbox(also_checked, label.as_str());
                     }
                     ui.add_space(14.0);
                     let mut outcome = Outcome::Open;
@@ -804,10 +829,15 @@ impl RepoTab {
                         .fill(t.danger)
                         .min_size(egui::vec2(90.0, 30.0));
                         if ui.add_enabled(idle, danger).clicked() {
-                            let steps = match (alternative, *use_alternative) {
+                            let mut steps = match (alternative, *use_alternative) {
                                 (Some((_, alt)), true) => alt.clone(),
                                 _ => ops.clone(),
                             };
+                            if let Some((_, extra)) = also
+                                && *also_checked
+                            {
+                                steps.extend(extra.clone());
+                            }
                             outcome = Outcome::Done(match undo {
                                 Undo::None => Action::Ops {
                                     label: title.clone(),
