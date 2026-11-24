@@ -25,12 +25,13 @@ impl RepoTab {
         ui.horizontal(|ui| {
             ui.add_space(10.0);
             icons::inline(ui, "search", 15.0, t.text_faint);
-            ui.add(
+            let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.branch_filter)
                     .hint_text("Filter branches, tags and submodules")
                     .desired_width((ui.available_width() - 10.0).max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
             );
+            widgets::text_edit_menu(&resp, &mut self.branch_filter);
         });
         ui.add_space(8.0);
 

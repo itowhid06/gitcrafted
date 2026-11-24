@@ -667,3 +667,177 @@ pub fn slider(
     })
     .inner
 }
+
+/// The usual right-click menu of a text field (`resp`, from adding a `TextEdit` over `text`):
+/// cut, copy, paste, select all and clear. egui's text fields have none of their own.
+pub fn text_edit_menu(resp: &Response, text: &mut String) {
+    use egui::text::{CCursor, CCursorRange};
+
+    let ctx = resp.ctx.clone();
+    let id = resp.id;
+    // A text field moves its cursor on any press, the right button's too, which would lose the
+    // selection the menu is opened for: kept from the frame before and put back.
+    let kept = id.with("selection-before-menu");
+    let right_press = resp.hovered()
+        && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+    if let Some(mut state) = egui::TextEdit::load_state(&ctx, id) {
+        if right_press {
+            if let Some(range) = ctx.data(|d| d.get_temp::<Option<CCursorRange>>(kept)).flatten() {
+                state.cursor.set_char_range(Some(range));
+                egui::TextEdit::store_state(&ctx, id, state);
+            }
+        } else {
+            let range = state.cursor.char_range();
+            ctx.data_mut(|d| d.insert_temp(kept, range));
+        }
+    }
+    // The selection as it was when the menu opened: clicking an entry may take the focus away.
+    let selection = || {
+        egui::TextEdit::load_state(&ctx, id)
+            .and_then(|s| s.cursor.char_range())
+            .filter(|r| !r.is_empty())
+            .map(|r| {
+                let r = r.as_sorted_char_range();
+                (usize::from(r.start), usize::from(r.end))
+            })
+    };
+    let byte = |s: &str, chars: usize| s.char_indices().nth(chars).map_or(s.len(), |(b, _)| b);
+    let set_cursor = |range: CCursorRange| {
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        state.cursor.set_char_range(Some(range));
+        egui::TextEdit::store_state(&ctx, id, state);
+        ctx.memory_mut(|m| m.request_focus(id));
+    };
+    egui::Popup::context_menu(resp)
+        .style(crate::theme::menu_style)
+        .show(|ui| {
+            let selected = selection();
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new("Cut"))
+                .clicked()
+                && let Some((from, to)) = selected
+            {
+                let (a, b) = (byte(text, from), byte(text, to));
+                ui.ctx().copy_text(text[a..b].to_owned());
+                text.replace_range(a..b, "");
+                set_cursor(CCursorRange::one(CCursor::new(from)));
+            }
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new("Copy"))
+                .clicked()
+                && let Some((from, to)) = selected
+            {
+                ui.ctx()
+                    .copy_text(text[byte(text, from)..byte(text, to)].to_owned());
+            }
+            if ui.button("Paste").clicked() {
+                // The clipboard is read by the window, which hands it to the focused field.
+                ctx.memory_mut(|m| m.request_focus(id));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
+            ui.separator();
+            if ui
+                .add_enabled(!text.is_empty(), egui::Button::new("Select all"))
+                .clicked()
+            {
+                set_cursor(CCursorRange::two(
+                    CCursor::new(0),
+                    CCursor::new(text.chars().count()),
+                ));
+            }
+            if ui
+                .add_enabled(!text.is_empty(), egui::Button::new("Clear"))
+                .clicked()
+            {
+                text.clear();
+                set_cursor(CCursorRange::one(CCursor::new(0)));
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    fn field() -> Harness<'static, String> {
+        let mut harness = Harness::new_ui_state(
+            |ui, text: &mut String| {
+                let resp = ui.add(egui::TextEdit::singleline(text));
+                super::text_edit_menu(&resp, text);
+            },
+            "feature/login".to_owned(),
+        );
+        harness.run();
+        harness
+    }
+
+    fn menu(harness: &mut Harness<'_, String>, entry: &str) -> Vec<egui::OutputCommand> {
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click_secondary();
+        harness.run();
+        harness.get_by_label(entry).click();
+        harness.step();
+        let commands = harness.output().platform_output.commands.clone();
+        harness.run();
+        commands
+    }
+
+    #[test]
+    fn the_text_field_menu_selects_cuts_and_clears() {
+        let mut harness = field();
+        // Nothing selected yet: copy and cut wait for a selection.
+        let copied = menu(&mut harness, "Copy");
+        assert!(
+            !copied
+                .iter()
+                .any(|c| matches!(c, egui::OutputCommand::CopyText(_))),
+            "{copied:?}"
+        );
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+
+        menu(&mut harness, "Select all");
+        let cut = menu(&mut harness, "Cut");
+        assert!(
+            cut.contains(&egui::OutputCommand::CopyText("feature/login".to_owned())),
+            "{cut:?}"
+        );
+        assert_eq!(harness.state(), "");
+
+        *harness.state_mut() = "main".to_owned();
+        harness.run();
+        menu(&mut harness, "Clear");
+        assert_eq!(harness.state(), "");
+    }
+
+    #[test]
+    fn the_text_field_menu_asks_the_window_to_paste() {
+        let mut harness = field();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click_secondary();
+        harness.run();
+        harness.get_by_label("Paste").click();
+        harness.step();
+        let asked = harness
+            .output()
+            .viewport_output
+            .values()
+            .flat_map(|v| v.commands.iter())
+            .any(|c| *c == egui::ViewportCommand::RequestPaste);
+        assert!(asked, "the window was not asked to paste");
+        harness.run();
+        // What the window answers goes into the field, which has the focus again.
+        assert!(
+            harness
+                .get_by_role(egui::accesskit::Role::TextInput)
+                .is_focused()
+        );
+        harness.event(egui::Event::Paste("-v2".to_owned()));
+        harness.run();
+        assert!(harness.state().contains("-v2"), "{}", harness.state());
+    }
+}
