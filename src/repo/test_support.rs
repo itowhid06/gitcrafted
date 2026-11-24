@@ -195,7 +195,7 @@ impl Fixture {
     pub fn open(dir: &Path) -> Fixture {
         configure(dir);
         let ctx = egui::Context::default();
-        let tab = RepoTab::new(dir.to_path_buf(), &ctx);
+        let tab = RepoTab::with_filter(dir.to_path_buf(), Default::default(), &ctx);
         let mut f = Fixture { ctx, tab };
         f.tab.reload(&f.ctx);
         f.pump();

@@ -88,6 +88,10 @@ fn parse_open_arg(raw: std::ffi::OsString) -> PathBuf {
 }
 
 fn main() -> eframe::Result {
+    // Started by ssh to ask the user something (see `askpass`): ask the window and exit.
+    if let Some(code) = gitcrafted::askpass::run_if_asked() {
+        std::process::exit(code);
+    }
     install_crash_log();
     gitcrafted::prepare();
     let options = eframe::NativeOptions {

@@ -11,7 +11,9 @@ pub fn prepare() {
 }
 
 pub mod app;
+pub mod askpass;
 mod avatars;
+mod code_theme;
 mod desktop_entry;
 pub mod file_dialog;
 mod forge;
@@ -26,4 +28,4 @@ mod tab_look;
 mod terminal;
 mod theme;
 mod update;
-mod vscode_theme;
+mod vscode;

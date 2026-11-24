@@ -267,7 +267,6 @@ impl RepoTab {
         if hash == WIP_HASH {
             return;
         }
-        self.edit_message_item(ui, acts, hash, idle);
         if ui
             .button("Save as patch…")
             .on_hover_text("This commit as a patch file (git format-patch)")

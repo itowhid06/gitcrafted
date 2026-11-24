@@ -274,6 +274,8 @@ pub(crate) enum CheckoutTarget {
     Branch(String),
     Pull(String),
     Remote { remote_branch: String, local: String },
+    /// Check `branch` out and fast-forward it to `target`.
+    Move { branch: String, target: String },
 }
 
 impl CheckoutTarget {
@@ -281,6 +283,7 @@ impl CheckoutTarget {
         match self {
             CheckoutTarget::Branch(b) | CheckoutTarget::Pull(b) => b,
             CheckoutTarget::Remote { local, .. } => local,
+            CheckoutTarget::Move { branch, .. } => branch,
         }
     }
 
@@ -290,6 +293,10 @@ impl CheckoutTarget {
             CheckoutTarget::Pull(b) => vec![
                 vec!["checkout".into(), b.clone()],
                 vec!["pull".into(), "--ff-only".into()],
+            ],
+            CheckoutTarget::Move { branch, target } => vec![
+                vec!["checkout".into(), branch.clone()],
+                vec!["merge".into(), "--ff-only".into(), target.clone()],
             ],
             CheckoutTarget::Remote { remote_branch, .. } => vec![vec![
                 "checkout".into(),
@@ -305,6 +312,10 @@ impl CheckoutTarget {
             CheckoutTarget::Pull(b) => vec![
                 vec!["checkout".into(), "--force".into(), b.clone()],
                 vec!["pull".into(), "--ff-only".into()],
+            ],
+            CheckoutTarget::Move { branch, target } => vec![
+                vec!["checkout".into(), "--force".into(), branch.clone()],
+                vec!["merge".into(), "--ff-only".into(), target.clone()],
             ],
             CheckoutTarget::Remote { remote_branch, .. } => vec![vec![
                 "checkout".into(),
