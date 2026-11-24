@@ -199,6 +199,8 @@ pub struct Branch {
     pub upstream: String,
     /// e.g. `[ahead 1, behind 2]`.
     pub track: String,
+    /// When its commit was made (an annotated tag: when it was tagged), in Unix seconds.
+    pub time: i64,
 }
 
 impl Branch {
@@ -235,7 +237,7 @@ pub struct Refs {
 
 pub fn refs(repo: &Path) -> Result<Refs, String> {
     let format = format!(
-        "%(refname){FS}%(objectname){FS}%(HEAD){FS}%(upstream){FS}%(upstream:track){FS}%(*objectname)"
+        "%(refname){FS}%(objectname){FS}%(HEAD){FS}%(upstream){FS}%(upstream:track){FS}%(*objectname){FS}%(creatordate:unix)"
     );
     let out = run(
         Some(repo),
@@ -250,9 +252,10 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
     let mut refs = Refs::default();
     for line in out.lines() {
         let f: Vec<&str> = line.split(FS).collect();
-        let [full, oid, head, upstream_full, track, peeled] = f[..] else {
+        let [full, oid, head, upstream_full, track, peeled, time] = f[..] else {
             continue;
         };
+        let time = time.trim().parse().unwrap_or(0);
         // Annotated tags point at a tag object; the commit is the peeled id.
         let target = if peeled.is_empty() { oid } else { peeled };
         let upstream = upstream_full
@@ -267,6 +270,7 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
                 is_head: head == "*",
                 upstream,
                 track: track.to_owned(),
+                time,
             };
             if branch.is_head {
                 refs.current = Some(branch.name.clone());
@@ -282,6 +286,7 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
                 is_head: head == "*",
                 upstream,
                 track: track.to_owned(),
+                time,
             };
             let remote = rest.split('/').next().unwrap_or_default().to_owned();
             match refs.remotes.iter_mut().find(|(r, _)| *r == remote) {
@@ -295,6 +300,7 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
                 is_head: head == "*",
                 upstream,
                 track: track.to_owned(),
+                time,
             };
             refs.tags.push(branch);
         }

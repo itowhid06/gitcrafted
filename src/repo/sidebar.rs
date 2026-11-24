@@ -11,15 +11,95 @@ use super::{
 };
 use crate::git::{self, Branch};
 use crate::icons;
+use crate::settings::{BranchSort, Settings};
 use crate::theme::{self, Tokens};
 
 /// The pane's rows: a little taller than the file lists', 2 px more above and below.
 const ROW_H: f32 = widgets::ROW_H + 4.0;
 
+/// The button in the pane's header that picks the order of the branches and tags.
+fn sort_button(ui: &mut Ui) {
+    let mut settings = Settings::get(ui.ctx());
+    let resp = icons::small_button(ui, "arrow-up-down", "Sort branches and tags");
+    egui::Popup::menu(&resp)
+        .style(crate::theme::menu_style)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let mut changed = false;
+            for sort in BranchSort::ALL {
+                changed |= ui
+                    .radio_value(&mut settings.branch_sort, sort, sort.label())
+                    .changed();
+            }
+            ui.separator();
+            changed |= ui
+                .checkbox(&mut settings.current_branch_first, "Checked-out branch first")
+                .changed();
+            if changed {
+                settings.set(ui.ctx());
+            }
+        });
+}
+
+/// `branches` in the order `sort` asks for, the checked-out one first with `head_first`.
+fn sort_branches(branches: &mut [&Branch], sort: BranchSort, head_first: bool) {
+    branches.sort_by(|a, b| {
+        let by_name = || natural_cmp(&a.name, &b.name);
+        let order = match sort {
+            BranchSort::NameAsc => by_name(),
+            BranchSort::NameDesc => by_name().reverse(),
+            BranchSort::Newest => b.time.cmp(&a.time).then_with(by_name),
+            BranchSort::Oldest => a.time.cmp(&b.time).then_with(by_name),
+        };
+        if head_first {
+            b.is_head.cmp(&a.is_head).then(order)
+        } else {
+            order
+        }
+    });
+}
+
+/// Compares names the way people read them: letters without regard to case, runs of digits
+/// by their value (`v2` before `v10`); names equal that way by their bytes.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let run = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut digits = String::new();
+                    while let Some(c) = it.next_if(char::is_ascii_digit) {
+                        digits.push(c);
+                    }
+                    digits
+                };
+                let (m, n) = (run(&mut x), run(&mut y));
+                let (m, n) = (m.trim_start_matches('0'), n.trim_start_matches('0'));
+                let order = m.len().cmp(&n.len()).then_with(|| m.cmp(n));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(c), Some(d)) => {
+                let order = c.to_lowercase().cmp(d.to_lowercase());
+                if order != Ordering::Equal {
+                    return order;
+                }
+                x.next();
+                y.next();
+            }
+        }
+    }
+}
+
 impl RepoTab {
     pub(super) fn sidebar(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let t = Tokens::get(ui.ctx());
-        widgets::panel_header(ui, "Branches", |_| {});
+        widgets::panel_header(ui, "Branches", sort_button);
         // Sized like the commit search bar (Ctrl+F).
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -38,6 +118,8 @@ impl RepoTab {
         let filter = self.branch_filter.to_lowercase();
         let matches = |b: &&Branch| filter.is_empty() || b.name.to_lowercase().contains(&filter);
         let idle = self.busy_op.is_none();
+        let settings = Settings::get(ui.ctx());
+        let (sort, head_first) = (settings.branch_sort, settings.current_branch_first);
 
         egui::ScrollArea::vertical()
             .id_salt("branches")
@@ -52,7 +134,8 @@ impl RepoTab {
                 ui.painter().rect_filled(sep, 0.0, t.separator);
                 ui.add_space(4.0);
 
-                let local: Vec<&Branch> = self.refs.local.iter().filter(matches).collect();
+                let mut local: Vec<&Branch> = self.refs.local.iter().filter(matches).collect();
+                sort_branches(&mut local, sort, head_first);
                 let count = self.visible_count(local.iter().map(|b| local_ref(&b.name)));
                 let (open, add) = widgets::section_with_button(
                     ui,
@@ -77,13 +160,14 @@ impl RepoTab {
                     }
                 }
 
-                self.remotes_section(ui, acts, idle, &filter);
+                self.remotes_section(ui, acts, idle, &filter, sort);
                 self.worktree_section(ui, acts, idle);
                 self.submodule_section(ui, acts, idle, &filter);
                 self.stash_section(ui, acts, idle);
                 self.pr_section(ui, acts, idle);
 
-                let tags: Vec<&Branch> = self.refs.tags.iter().filter(matches).collect();
+                let mut tags: Vec<&Branch> = self.refs.tags.iter().filter(matches).collect();
+                sort_branches(&mut tags, sort, false);
                 if !tags.is_empty()
                     && widgets::section(ui, "tags", "tag", "TAGS", tags.len(), false)
                 {
@@ -611,7 +695,14 @@ impl RepoTab {
         "main".to_owned()
     }
 
-    fn remotes_section(&self, ui: &mut Ui, acts: &mut Vec<Action>, idle: bool, filter: &str) {
+    fn remotes_section(
+        &self,
+        ui: &mut Ui,
+        acts: &mut Vec<Action>,
+        idle: bool,
+        filter: &str,
+        sort: BranchSort,
+    ) {
         let t = Tokens::get(ui.ctx());
         let (open, add) = widgets::section_with_button(
             ui,
@@ -630,7 +721,7 @@ impl RepoTab {
         }
         let current = self.refs.current.clone();
         for remote in &self.remotes {
-            let branches: Vec<&Branch> = self
+            let mut branches: Vec<&Branch> = self
                 .refs
                 .remotes
                 .iter()
@@ -638,6 +729,7 @@ impl RepoTab {
                 .flat_map(|(_, list)| list.iter())
                 .filter(|b| filter.is_empty() || b.name.to_lowercase().contains(filter))
                 .collect();
+            sort_branches(&mut branches, sort, false);
             ui.push_id(("remote", &remote.name), |ui| {
                 // A collapsible row per remote.
                 let id = ui.id().with(("remote-open", &remote.name));
@@ -1373,4 +1465,64 @@ fn plain_row(ui: &mut Ui, icon: &str, name: &str, sub: &str) -> Response {
         );
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repo::test_support::*;
+
+    fn branch(name: &str, time: i64, is_head: bool) -> Branch {
+        Branch {
+            name: name.to_owned(),
+            target: String::new(),
+            is_head,
+            upstream: String::new(),
+            track: String::new(),
+            time,
+        }
+    }
+
+    fn names(list: &[&Branch]) -> Vec<String> {
+        list.iter().map(|b| b.name.clone()).collect()
+    }
+
+    #[test]
+    fn names_compare_without_case_and_numbers_by_value() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_cmp("v2", "v10"), Less);
+        assert_eq!(natural_cmp("release-1.10", "release-1.9"), Greater);
+        assert_eq!(natural_cmp("Feature", "fix"), Less);
+        assert_eq!(natural_cmp("a", "a/b"), Less);
+        assert_eq!(natural_cmp("v02", "v2"), Less);
+        assert_eq!(natural_cmp("main", "main"), Equal);
+    }
+
+    #[test]
+    fn branches_sort_by_name_or_commit_time() {
+        let (a, b, c) = (
+            branch("beta", 300, false),
+            branch("Alpha", 100, false),
+            branch("gamma", 200, true),
+        );
+        let mut list = vec![&a, &b, &c];
+        sort_branches(&mut list, BranchSort::NameAsc, false);
+        assert_eq!(names(&list), ["Alpha", "beta", "gamma"]);
+        sort_branches(&mut list, BranchSort::NameDesc, false);
+        assert_eq!(names(&list), ["gamma", "beta", "Alpha"]);
+        sort_branches(&mut list, BranchSort::Newest, false);
+        assert_eq!(names(&list), ["beta", "gamma", "Alpha"]);
+        sort_branches(&mut list, BranchSort::Oldest, false);
+        assert_eq!(names(&list), ["Alpha", "gamma", "beta"]);
+        sort_branches(&mut list, BranchSort::NameAsc, true);
+        assert_eq!(names(&list), ["gamma", "Alpha", "beta"]);
+    }
+
+    #[test]
+    fn refs_carry_their_commit_time() {
+        let dir = repo("sb-ref-time");
+        let refs = git::refs(&dir).unwrap_or_default();
+        assert!(refs.local.iter().all(|b| b.time > 0), "{:?}", refs.local);
+    }
+
 }

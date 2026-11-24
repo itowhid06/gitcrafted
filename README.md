@@ -100,6 +100,9 @@ test suite that drives real repositories to make sure none of it can lose your w
 - Local branches with ahead/behind; right-click: check out (or in a new worktree), fast-forward,
   merge into / (interactively) rebase onto the current branch, push, force push (with a lease),
   create a pull request, rename, delete…
+- The arrows in the pane's header sort branches and tags by name (A → Z or Z → A, `v2` before
+  `v10`) or by their latest commit (newest or oldest first), optionally with the checked-out
+  branch on top.
 - The filter box above the branches has the usual right-click menu (cut, copy, paste, select
   all, clear).
 - Remotes: add, edit (name and URL), fetch one, remove; their branches below each.

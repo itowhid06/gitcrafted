@@ -46,6 +46,10 @@ pub struct Settings {
     pub diff_whole_file: bool,
     /// A commit's files in a tree of their folders rather than a list of paths.
     pub files_as_tree: bool,
+    /// The order of the branches and tags in the left pane.
+    pub branch_sort: BranchSort,
+    /// The checked-out branch at the top of the local branches, whatever the order.
+    pub current_branch_first: bool,
     /// Background fetch interval in minutes; 0 turns it off.
     pub auto_fetch_minutes: u32,
     /// Load avatars: GitHub / GitLab accounts on repositories hosted there, Gravatar otherwise.
@@ -76,6 +80,8 @@ impl Default for Settings {
             diff_split: false,
             diff_whole_file: false,
             files_as_tree: false,
+            branch_sort: BranchSort::default(),
+            current_branch_first: false,
             auto_fetch_minutes: 10,
             avatars: true,
             editor: "code".to_owned(),
@@ -84,6 +90,38 @@ impl Default for Settings {
             theme: CodeTheme::default(),
             imported_themes: Vec::new(),
             profiles: Vec::new(),
+        }
+    }
+}
+
+/// The order of the branches and tags in the left pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BranchSort {
+    /// By name, `a` to `z` (numbers in names by value: `v2` before `v10`).
+    #[default]
+    NameAsc,
+    /// By name, `z` to `a`.
+    NameDesc,
+    /// The most recently committed to first.
+    Newest,
+    /// The least recently committed to first.
+    Oldest,
+}
+
+impl BranchSort {
+    pub const ALL: [BranchSort; 4] = [
+        BranchSort::NameAsc,
+        BranchSort::NameDesc,
+        BranchSort::Newest,
+        BranchSort::Oldest,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BranchSort::NameAsc => "Name (A → Z)",
+            BranchSort::NameDesc => "Name (Z → A)",
+            BranchSort::Newest => "Latest commit first",
+            BranchSort::Oldest => "Oldest commit first",
         }
     }
 }
