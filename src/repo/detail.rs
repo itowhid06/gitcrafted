@@ -842,6 +842,32 @@ impl RepoTab {
         ui.separator();
     }
 
+    /// The commit box's checkboxes: amend the last commit, skip the hooks.
+    fn commit_options(&mut self, ui: &mut Ui, can_amend: bool, rebasing: bool) {
+        let amend = ui
+            .add_enabled(
+                can_amend,
+                egui::Checkbox::new(&mut self.amend, "Amend last commit"),
+            )
+            .on_hover_text("Rewrite the last commit with the staged changes and this message");
+        if amend.changed()
+            && self.amend
+            && self.commit_summary.trim().is_empty()
+            && let Some(msg) = &self.head_message
+        {
+            let (summary, body) = msg.split_once('\n').unwrap_or((msg.as_str(), ""));
+            self.commit_summary = summary.trim().to_owned();
+            self.commit_body = body.trim().to_owned();
+        }
+        ui.add_enabled(
+            !rebasing,
+            egui::Checkbox::new(&mut self.no_verify, "Skip hooks"),
+        )
+        .on_hover_text(
+            "Commit with --no-verify: the pre-commit and commit-msg hooks don't run (this commit only)",
+        );
+    }
+
     fn commit_box(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let t = Tokens::get(ui.ctx());
         let idle = self.busy_op.is_none();
@@ -850,6 +876,11 @@ impl RepoTab {
         if !can_amend {
             self.amend = false;
         }
+        if rebasing {
+            self.no_verify = false;
+        }
+        // The options sit beside the title, or under it when the panel is narrow.
+        let wide = ui.available_width() >= 330.0;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(if rebasing {
@@ -860,24 +891,15 @@ impl RepoTab {
                 .font(theme::semibold(10.5))
                 .color(t.text_faint),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let amend = ui
-                    .add_enabled(
-                        can_amend,
-                        egui::Checkbox::new(&mut self.amend, "Amend last commit"),
-                    )
-                    .on_hover_text(
-                        "Rewrite the last commit with the staged changes and this message",
-                    );
-                if amend.changed() && self.amend && self.commit_summary.trim().is_empty()
-                    && let Some(msg) = &self.head_message
-                {
-                    let (summary, body) = msg.split_once('\n').unwrap_or((msg.as_str(), ""));
-                    self.commit_summary = summary.trim().to_owned();
-                    self.commit_body = body.trim().to_owned();
-                }
-            });
+            if wide {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.commit_options(ui, can_amend, rebasing);
+                });
+            }
         });
+        if !wide {
+            ui.horizontal_wrapped(|ui| self.commit_options(ui, can_amend, rebasing));
+        }
         if self.amend {
             let pushed = self
                 .refs

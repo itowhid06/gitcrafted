@@ -559,6 +559,8 @@ pub struct RepoTab {
     commit_summary: String,
     commit_body: String,
     amend: bool,
+    /// Commit with `--no-verify`: the pre-commit and commit-msg hooks don't run.
+    no_verify: bool,
     dialog: Option<Dialog>,
     search: Search,
     /// A commit to select once enough history is loaded (search results, links).
@@ -682,6 +684,7 @@ impl RepoTab {
             commit_summary: String::new(),
             commit_body: String::new(),
             amend: false,
+            no_verify: false,
             dialog: None,
             search: Search::default(),
             pending_goto: None,
@@ -1919,6 +1922,9 @@ impl RepoTab {
         if amend {
             commit.push("--amend".to_owned());
         }
+        if self.no_verify {
+            commit.push("--no-verify".to_owned());
+        }
         commit.extend(["-m".to_owned(), summary.to_owned()]);
         let body = self.commit_body.trim();
         if !body.is_empty() {
@@ -2463,6 +2469,7 @@ impl RepoTab {
                             self.commit_summary.clear();
                             self.commit_body.clear();
                             self.amend = false;
+                            self.no_verify = false;
                         }
                         // Quiet success for staging, which happens all the time.
                         if refresh == Refresh::All && !quiet {
@@ -4077,6 +4084,7 @@ error: failed to push some refs";
                 f.tab.ui(ui);
             });
         harness.run();
+        assert!(harness.query_by_label("Skip hooks").is_some());
         // The commit summary: the lowest one-line field (the branch filter is at the top).
         let summary = harness
             .get_all_by_role(egui::accesskit::Role::TextInput)
@@ -4093,5 +4101,46 @@ error: failed to push some refs";
         drop(harness);
         assert_eq!(f.tab.commit_summary, "Fix the login");
         assert_eq!(f.tab.commit_body, "The token expired too early.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skip_hooks_commits_past_a_failing_pre_commit_hook() {
+        use super::Action;
+        use super::test_support::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = repo("commit-no-verify");
+        let hook = dir.join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(dir.join(".git/hooks")).unwrap_or_default();
+        std::fs::write(&hook, "#!/bin/sh\necho blocked by hook >&2\nexit 1\n").unwrap_or_default();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap_or_default();
+        let mut f = Fixture::open(&dir);
+
+        // The hook stops a plain commit, and the message stays to retry with.
+        write(&dir, "a.txt", "two\n");
+        f.reload();
+        f.tab.commit_summary = "Past the hook".to_owned();
+        f.run(Action::Commit);
+        assert!(f.failed(), "{:?}", f.status());
+        assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "initial");
+        assert_eq!(f.tab.commit_summary, "Past the hook");
+
+        f.tab.no_verify = true;
+        f.run(Action::Commit);
+        assert!(!f.failed(), "{:?}", f.status());
+        assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "Past the hook");
+        assert!(!f.tab.no_verify, "skipping hooks is for one commit");
+
+        // Amending skips them the same way.
+        f.tab.amend = true;
+        f.tab.no_verify = true;
+        f.tab.commit_summary = "Amended past the hook".to_owned();
+        f.run(Action::Commit);
+        assert!(!f.failed(), "{:?}", f.status());
+        assert_eq!(
+            git(&dir, &["log", "--format=%s"]),
+            "Amended past the hook\ninitial"
+        );
     }
 }

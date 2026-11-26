@@ -57,6 +57,7 @@ const FEATURES: &[(&str, &[&str])] = &[
             "Write the summary and description and commit; amend the last commit; pick the identity you commit as.",
             "Paste a whole message (several lines) into the summary: its first line stays there and the rest goes into the description. The merge and pull request dialogs do the same with their message and title.",
             "Right-click a text field to cut, copy, paste, select all or clear it (password fields only paste and clear). A pasted password or token drops the line break copied with it.",
+            "Skip hooks commits with --no-verify, so the pre-commit and commit-msg hooks don't run. It applies to one commit and then switches off.",
             "Double-click a commit's message in the right pane, or right-click the commit and choose Edit message…, to edit it (any commit of the checked-out branch with no merges after it).",
             "Commit & Push, next to the commit button, commits and then pushes the branch.",
             "Undo and redo commits, merges, rebases, resets, checkouts, branches, tags and stashes.",
