@@ -773,6 +773,21 @@ fn edit_menu(resp: &Response, text: &mut String, secret: bool) -> bool {
     changed
 }
 
+/// A whole commit message split like git does: the first non-blank line, and what follows it
+/// without the blank lines in between (line endings normalised, trailing space dropped).
+pub fn split_message(text: &str) -> (String, String) {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = text.lines().skip_while(|l| l.trim().is_empty());
+    let summary = lines.next().unwrap_or_default().trim().to_owned();
+    let body = lines
+        .skip_while(|l| l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_owned();
+    (summary, body)
+}
+
 /// Call before adding the one-line field `id` that takes a password or token: a paste drops the
 /// line breaks around it (copied from a terminal or a password manager, they would otherwise turn
 /// into spaces the host refuses). Spaces typed or pasted inside are kept.
@@ -787,6 +802,51 @@ pub fn trim_pasted_secret(ui: &Ui, id: egui::Id) {
                 if trimmed.len() != text.len() {
                     *text = trimmed.to_owned();
                 }
+            }
+        }
+    });
+}
+
+/// Call before adding the summary (`summary_id`) and description (`body_id`) fields of a commit
+/// message. A pasted message of several lines goes where it belongs: pasted into the summary,
+/// its first line stays there and the rest goes in front of the description; pasted into the
+/// description while both are empty, its first line becomes the summary.
+pub fn route_message_paste(
+    ui: &Ui,
+    summary_id: egui::Id,
+    body_id: egui::Id,
+    summary: &mut String,
+    body: &mut String,
+) {
+    let into_summary = ui.memory(|m| m.has_focus(summary_id));
+    let into_body = !into_summary
+        && ui.memory(|m| m.has_focus(body_id))
+        && summary.trim().is_empty()
+        && body.trim().is_empty();
+    if !into_summary && !into_body {
+        return;
+    }
+    ui.ctx().input_mut(|i| {
+        for event in &mut i.events {
+            let egui::Event::Paste(text) = event else {
+                continue;
+            };
+            if !text.contains(['\n', '\r']) {
+                continue;
+            }
+            let (first, rest) = split_message(text);
+            if into_summary {
+                // The field takes the first line where the cursor is, as typed.
+                *text = first;
+                if !rest.is_empty() {
+                    *body = match body.trim() {
+                        "" => rest,
+                        old => format!("{rest}\n\n{old}"),
+                    };
+                }
+            } else if !rest.is_empty() {
+                *summary = first;
+                *text = rest;
             }
         }
     });
@@ -944,5 +1004,77 @@ mod tests {
         harness.get_by_label("Clear").click();
         harness.run();
         assert_eq!(harness.state(), "");
+    }
+
+    #[test]
+    fn a_message_splits_into_summary_and_description() {
+        let split = |s: &str| super::split_message(s);
+        assert_eq!(split("Fix it"), ("Fix it".to_owned(), String::new()));
+        assert_eq!(split("Fix it\n"), ("Fix it".to_owned(), String::new()));
+        assert_eq!(
+            split("\r\n  Fix it  \r\n\r\nBecause.\r\n\r\n  - one\r\n- two\r\n\r\n"),
+            ("Fix it".to_owned(), "Because.\n\n  - one\n- two".to_owned())
+        );
+        assert_eq!(
+            split("Fix it\nno blank line"),
+            ("Fix it".to_owned(), "no blank line".to_owned())
+        );
+    }
+
+    /// Two message fields (summary, description) with the paste routing, and which has focus.
+    fn message_fields(focus_body: bool) -> Harness<'static, (String, String)> {
+        let mut harness = Harness::new_ui_state(
+            move |ui, (summary, body): &mut (String, String)| {
+                let (sid, bid) = (egui::Id::new("summary"), egui::Id::new("body"));
+                super::route_message_paste(ui, sid, bid, summary, body);
+                let s = ui.add(egui::TextEdit::singleline(summary).id(sid));
+                let b = ui.add(egui::TextEdit::multiline(body).id(bid));
+                if !ui.memory(|m| m.has_focus(sid) || m.has_focus(bid)) {
+                    if focus_body { b } else { s }.request_focus();
+                }
+            },
+            (String::new(), String::new()),
+        );
+        harness.run();
+        harness
+    }
+
+    #[test]
+    fn a_whole_message_pasted_into_the_summary_fills_both_fields() {
+        let mut harness = message_fields(false);
+        harness.state_mut().1 = "Kept.".to_owned();
+        harness.run();
+        harness.event(egui::Event::Paste(
+            "Add login\n\nWith a remember-me box.\n- and tests".to_owned(),
+        ));
+        harness.run();
+        let (summary, body) = harness.state();
+        assert_eq!(summary, "Add login");
+        assert_eq!(body, "With a remember-me box.\n- and tests\n\nKept.");
+
+        // One line (even copied with its line break) only goes in the summary.
+        let mut harness = message_fields(false);
+        harness.event(egui::Event::Paste("Fix typo\n".to_owned()));
+        harness.run();
+        assert_eq!(harness.state(), &("Fix typo".to_owned(), String::new()));
+    }
+
+    #[test]
+    fn a_whole_message_pasted_into_empty_fields_fills_both() {
+        let mut harness = message_fields(true);
+        harness.event(egui::Event::Paste("Add login\r\n\r\nWhy.".to_owned()));
+        harness.run();
+        assert_eq!(
+            harness.state(),
+            &("Add login".to_owned(), "Why.".to_owned())
+        );
+
+        // With a summary written, the description takes the paste as it is.
+        let mut harness = message_fields(true);
+        harness.state_mut().0 = "Mine".to_owned();
+        harness.run();
+        harness.event(egui::Event::Paste("one\ntwo".to_owned()));
+        harness.run();
+        assert_eq!(harness.state(), &("Mine".to_owned(), "one\ntwo".to_owned()));
     }
 }

@@ -40,7 +40,9 @@ struct MergeDialog {
     ff: FastForward,
     squash: bool,
     no_commit: bool,
+    /// The merge commit's summary and description (both optional: git writes its own).
     message: String,
+    body: String,
 }
 
 pub(super) fn merge_dialog(branch: &str, current: &str) -> Dialog {
@@ -51,10 +53,21 @@ pub(super) fn merge_dialog(branch: &str, current: &str) -> Dialog {
         squash: false,
         no_commit: false,
         message: String::new(),
+        body: String::new(),
     })
 }
 
 impl MergeDialog {
+    /// The summary, then the description after a blank line; a description alone is the whole
+    /// message (its first line the summary, as git reads it).
+    fn message(&self) -> String {
+        match (self.message.trim(), self.body.trim()) {
+            (summary, "") => summary.to_owned(),
+            ("", body) => body.to_owned(),
+            (summary, body) => format!("{summary}\n\n{body}"),
+        }
+    }
+
     fn args(&self) -> Vec<String> {
         let mut args = vec!["merge".to_owned()];
         if self.squash {
@@ -74,11 +87,11 @@ impl MergeDialog {
         if self.no_commit {
             args.push("--no-commit".into());
         }
-        let message = self.message.trim();
+        let message = self.message();
         if message.is_empty() || self.squash || self.no_commit {
             args.push("--no-edit".into());
         } else {
-            args.extend(["-m".to_owned(), message.to_owned()]);
+            args.extend(["-m".to_owned(), message]);
         }
         args.push(self.branch.clone());
         args
@@ -114,14 +127,36 @@ impl DialogBody for MergeDialog {
         });
         ui.add_space(4.0);
         ui.add_enabled_ui(!self.squash && !self.no_commit, |ui| {
+            let (summary_id, body_id) = (
+                ui.make_persistent_id("merge_summary"),
+                ui.make_persistent_id("merge_body"),
+            );
+            widgets::route_message_paste(
+                ui,
+                summary_id,
+                body_id,
+                &mut self.message,
+                &mut self.body,
+            );
             let summary = ui.add(
                 egui::TextEdit::singleline(&mut self.message)
+                    .id(summary_id)
                     .hint_text("Merge commit message (optional)")
                     .desired_width(f32::INFINITY)
                     .margin(egui::Margin::symmetric(8, 6)),
             );
+            ui.add_space(4.0);
+            let body = ui.add(
+                egui::TextEdit::multiline(&mut self.body)
+                    .id(body_id)
+                    .hint_text("Description (optional)")
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2)
+                    .margin(egui::Margin::symmetric(8, 6)),
+            );
             if ui.is_enabled() {
                 widgets::text_edit_menu(&summary, &mut self.message);
+                widgets::text_edit_menu(&body, &mut self.body);
             }
         });
         ui.add_space(6.0);
@@ -1017,10 +1052,28 @@ mod tests {
             squash: false,
             no_commit: false,
             message: String::new(),
+            body: String::new(),
         };
         assert_eq!(m.args(), ["merge", "--no-ff", "--no-edit", "feat"]);
         m.message = " Merge feat ".into();
         assert_eq!(m.args(), ["merge", "--no-ff", "-m", "Merge feat", "feat"]);
+        m.body = "\nWhy it joins.\n".into();
+        assert_eq!(
+            m.args(),
+            [
+                "merge",
+                "--no-ff",
+                "-m",
+                "Merge feat\n\nWhy it joins.",
+                "feat"
+            ]
+        );
+        m.message.clear();
+        assert_eq!(
+            m.args(),
+            ["merge", "--no-ff", "-m", "Why it joins.", "feat"]
+        );
+        m.body.clear();
         m.squash = true;
         assert_eq!(m.args(), ["merge", "--squash", "--no-edit", "feat"]);
         m.squash = false;
@@ -1131,6 +1184,7 @@ mod tests {
             squash,
             no_commit,
             message: msg.into(),
+            body: String::new(),
         };
         // A merge commit with a message.
         assert!(git(
@@ -1188,6 +1242,7 @@ mod flow_tests {
             squash: false,
             no_commit: false,
             message: String::new(),
+            body: String::new(),
         }
     }
 
@@ -1625,6 +1680,7 @@ mod safety_tests {
             squash: false,
             no_commit: false,
             message: String::new(),
+            body: String::new(),
         };
         f.run(d.action());
         assert!(f.failed());
@@ -1648,6 +1704,7 @@ mod safety_tests {
             squash: false,
             no_commit: false,
             message: String::new(),
+            body: String::new(),
         };
         f.run(d.action());
         assert!(!f.failed(), "{:?}", f.status());
@@ -1711,6 +1768,7 @@ mod review_tests {
             squash: false,
             no_commit: true,
             message: String::new(),
+            body: String::new(),
         };
         f.run(d.action());
         assert!(!f.failed(), "{:?}", f.status());

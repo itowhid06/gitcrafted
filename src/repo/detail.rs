@@ -896,9 +896,21 @@ impl RepoTab {
             }
         }
         ui.add_space(2.0);
+        let (summary_id, body_id) = (
+            ui.make_persistent_id("commit_summary"),
+            ui.make_persistent_id("commit_body"),
+        );
+        widgets::route_message_paste(
+            ui,
+            summary_id,
+            body_id,
+            &mut self.commit_summary,
+            &mut self.commit_body,
+        );
         let summary = ui.add_enabled(
             !rebasing,
             egui::TextEdit::singleline(&mut self.commit_summary)
+                .id(summary_id)
                 .hint_text(if rebasing {
                     "Rebase uses each commit's message"
                 } else {
@@ -910,6 +922,7 @@ impl RepoTab {
         let body = ui.add_enabled(
             !rebasing,
             egui::TextEdit::multiline(&mut self.commit_body)
+                .id(body_id)
                 .hint_text("Description (optional)")
                 .desired_width(f32::INFINITY)
                 .desired_rows(3)
@@ -1264,8 +1277,20 @@ impl Reword {
 /// `Some(false)` to cancel.
 fn reword_editor(ui: &mut Ui, reword: &mut Reword, allow_keys: bool) -> Option<bool> {
     let t = Tokens::get(ui.ctx());
+    let (summary_id, body_id) = (
+        ui.make_persistent_id("reword_summary"),
+        ui.make_persistent_id("reword_body"),
+    );
+    widgets::route_message_paste(
+        ui,
+        summary_id,
+        body_id,
+        &mut reword.subject,
+        &mut reword.body,
+    );
     let summary = ui.add(
         egui::TextEdit::singleline(&mut reword.subject)
+            .id(summary_id)
             .font(theme::semibold(14.0))
             .hint_text("Summary")
             .desired_width(f32::INFINITY),
@@ -1278,6 +1303,7 @@ fn reword_editor(ui: &mut Ui, reword: &mut Reword, allow_keys: bool) -> Option<b
     ui.add_space(4.0);
     let body = ui.add(
         egui::TextEdit::multiline(&mut reword.body)
+            .id(body_id)
             .hint_text("Description (optional)")
             .desired_rows(4)
             .desired_width(f32::INFINITY),

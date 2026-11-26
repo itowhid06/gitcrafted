@@ -785,10 +785,15 @@ impl RepoTab {
                 }
                 Dialog::CreatePr { noun, branch, base, title: pr_title, body, draft, focus } => {
                     title(ui, &format!("Create {noun}"), &format!("{branch} → {base} (the branch is pushed first)"), &t);
-                    field(ui, pr_title, "Title", focus);
+                    // A whole message pasted into the title splits like the commit box's.
+                    let (title_id, body_id) =
+                        (ui.make_persistent_id("pr_title"), ui.make_persistent_id("pr_body"));
+                    widgets::route_message_paste(ui, title_id, body_id, pr_title, body);
+                    field_with_id(ui, pr_title, "Title", focus, Some(title_id));
                     ui.add_space(4.0);
                     let edit = ui.add(
                         egui::TextEdit::multiline(body)
+                            .id(body_id)
                             .hint_text("Description")
                             .desired_width(f32::INFINITY)
                             .desired_rows(5)
@@ -935,12 +940,25 @@ pub(super) fn title(ui: &mut egui::Ui, heading: &str, sub: &str, t: &Tokens) {
 /// A single-line field that takes the keyboard when the dialog opens, with the usual
 /// right-click menu.
 fn field(ui: &mut egui::Ui, text: &mut String, hint: &str, focus: &mut bool) -> egui::Response {
-    let mut edit = ui.add(
-        egui::TextEdit::singleline(text)
-            .hint_text(hint)
-            .desired_width(f32::INFINITY)
-            .margin(egui::Margin::symmetric(8, 6)),
-    );
+    field_with_id(ui, text, hint, focus, None)
+}
+
+/// [`field`] with the id the `TextEdit` takes, for code that has to know it beforehand.
+fn field_with_id(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: &str,
+    focus: &mut bool,
+    id: Option<egui::Id>,
+) -> egui::Response {
+    let mut edit = egui::TextEdit::singleline(text)
+        .hint_text(hint)
+        .desired_width(f32::INFINITY)
+        .margin(egui::Margin::symmetric(8, 6));
+    if let Some(id) = id {
+        edit = edit.id(id);
+    }
+    let mut edit = ui.add(edit);
     // A menu entry that changes the text counts as an edit (fields derived from it follow).
     if widgets::text_edit_menu(&edit, text) {
         edit.mark_changed();

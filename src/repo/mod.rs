@@ -4057,4 +4057,41 @@ error: failed to push some refs";
         f.tab.apply(Action::DismissStatus, &f.ctx);
         assert!(f.tab.status.is_none());
     }
+
+    #[test]
+    fn a_message_pasted_into_the_commit_box_fills_summary_and_description() {
+        use super::test_support::*;
+        use egui_kittest::kittest::Queryable;
+
+        let dir = repo("commit-box-paste");
+        write(&dir, "a.txt", "two\n");
+        let mut f = Fixture::open(&dir);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([1200.0, 800.0])
+            .build_ui(|ui| {
+                if ui.ctx().cumulative_frame_nr() == 0 {
+                    crate::theme::install_fonts(ui.ctx());
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                f.tab.ui(ui);
+            });
+        harness.run();
+        // The commit summary: the lowest one-line field (the branch filter is at the top).
+        let summary = harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .max_by(|a, b| a.rect().top().total_cmp(&b.rect().top()));
+        assert!(summary.is_some(), "no one-line field");
+        if let Some(summary) = summary {
+            summary.click();
+        }
+        harness.run();
+        harness.event(egui::Event::Paste(
+            "Fix the login\n\nThe token expired too early.\n".to_owned(),
+        ));
+        harness.run();
+        drop(harness);
+        assert_eq!(f.tab.commit_summary, "Fix the login");
+        assert_eq!(f.tab.commit_body, "The token expired too early.");
+    }
 }
