@@ -466,6 +466,7 @@ impl ApplyDialog {
                     .desired_width((ui.available_width() - 92.0).max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
             );
+            super::widgets::text_edit_menu(&edit, &mut self.file);
             if self.focus {
                 edit.request_focus();
                 self.focus = false;

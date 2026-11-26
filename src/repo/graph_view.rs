@@ -740,7 +740,7 @@ impl RepoTab {
                 ui.horizontal(|ui| {
                     icons::inline(ui, "search", 15.0, t.text_faint);
                     let code = self.search.code;
-                    let edit = ui.add(
+                    let mut edit = ui.add(
                         egui::TextEdit::singleline(&mut self.search.query)
                             .hint_text(if code {
                                 "Search code added or removed by a commit, in all history"
@@ -750,6 +750,9 @@ impl RepoTab {
                             .desired_width((ui.available_width() - 290.0).max(120.0))
                             .margin(egui::Margin::symmetric(8, 4)),
                     );
+                    if super::widgets::text_edit_menu(&edit, &mut self.search.query) {
+                        edit.mark_changed();
+                    }
                     // Where to look: commit messages or the code they changed.
                     for (label, on, tip) in [
                         (

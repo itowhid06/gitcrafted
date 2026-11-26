@@ -183,6 +183,7 @@ impl DialogBody for LfsDialog {
                     .desired_width((ui.available_width() - 70.0).max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
             );
+            super::widgets::text_edit_menu(&edit, &mut self.new_pattern);
             let p = self.new_pattern.trim();
             let can = !p.is_empty();
             if (ui.add_enabled(can, egui::Button::new("Track")).clicked()
@@ -239,12 +240,13 @@ impl DialogBody for LfsDialog {
         ui.add_space(8.0);
         ui.label(RichText::new("Locks").color(t.text_dim));
         ui.horizontal(|ui| {
-            ui.add(
+            let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.lock_path)
                     .hint_text("path/to/file.psd")
                     .desired_width((ui.available_width() - 130.0).max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
             );
+            super::widgets::text_edit_menu(&edit, &mut self.lock_path);
             let path = self.lock_path.trim().to_owned();
             let can = !path.is_empty();
             if ui.add_enabled(can, egui::Button::new("Lock")).clicked() {

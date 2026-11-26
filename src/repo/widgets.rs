@@ -670,7 +670,18 @@ pub fn slider(
 
 /// The usual right-click menu of a text field (`resp`, from adding a `TextEdit` over `text`):
 /// cut, copy, paste, select all and clear. egui's text fields have none of their own.
-pub fn text_edit_menu(resp: &Response, text: &mut String) {
+/// Returns whether an entry changed the text here (a paste arrives as typing, next frame).
+pub fn text_edit_menu(resp: &Response, text: &mut String) -> bool {
+    edit_menu(resp, text, false)
+}
+
+/// The right-click menu of a password field: paste, select all and clear, but nothing that puts
+/// the hidden text on the clipboard.
+pub fn secret_edit_menu(resp: &Response, text: &mut String) -> bool {
+    edit_menu(resp, text, true)
+}
+
+fn edit_menu(resp: &Response, text: &mut String, secret: bool) -> bool {
     use egui::text::{CCursor, CCursorRange};
 
     let ctx = resp.ctx.clone();
@@ -708,23 +719,27 @@ pub fn text_edit_menu(resp: &Response, text: &mut String) {
         egui::TextEdit::store_state(&ctx, id, state);
         ctx.memory_mut(|m| m.request_focus(id));
     };
+    let mut changed = false;
     egui::Popup::context_menu(resp)
         .style(crate::theme::menu_style)
         .show(|ui| {
-            let selected = selection();
-            if ui
-                .add_enabled(selected.is_some(), egui::Button::new("Cut"))
-                .clicked()
+            let selected = selection().filter(|_| !secret);
+            if !secret
+                && ui
+                    .add_enabled(selected.is_some(), egui::Button::new("Cut"))
+                    .clicked()
                 && let Some((from, to)) = selected
             {
                 let (a, b) = (byte(text, from), byte(text, to));
                 ui.ctx().copy_text(text[a..b].to_owned());
                 text.replace_range(a..b, "");
+                changed = true;
                 set_cursor(CCursorRange::one(CCursor::new(from)));
             }
-            if ui
-                .add_enabled(selected.is_some(), egui::Button::new("Copy"))
-                .clicked()
+            if !secret
+                && ui
+                    .add_enabled(selected.is_some(), egui::Button::new("Copy"))
+                    .clicked()
                 && let Some((from, to)) = selected
             {
                 ui.ctx()
@@ -751,9 +766,30 @@ pub fn text_edit_menu(resp: &Response, text: &mut String) {
                 .clicked()
             {
                 text.clear();
+                changed = true;
                 set_cursor(CCursorRange::one(CCursor::new(0)));
             }
         });
+    changed
+}
+
+/// Call before adding the one-line field `id` that takes a password or token: a paste drops the
+/// line breaks around it (copied from a terminal or a password manager, they would otherwise turn
+/// into spaces the host refuses). Spaces typed or pasted inside are kept.
+pub fn trim_pasted_secret(ui: &Ui, id: egui::Id) {
+    if !ui.memory(|m| m.has_focus(id)) {
+        return;
+    }
+    ui.ctx().input_mut(|i| {
+        for event in &mut i.events {
+            if let egui::Event::Paste(text) = event {
+                let trimmed = text.trim_matches(['\r', '\n']);
+                if trimmed.len() != text.len() {
+                    *text = trimmed.to_owned();
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -839,5 +875,74 @@ mod tests {
         harness.event(egui::Event::Paste("-v2".to_owned()));
         harness.run();
         assert!(harness.state().contains("-v2"), "{}", harness.state());
+    }
+
+    /// A focused password field with the pasted-secret trimming and its menu.
+    fn password_field() -> Harness<'static, String> {
+        let mut harness = Harness::new_ui_state(
+            |ui, text: &mut String| {
+                let id = egui::Id::new("password");
+                super::trim_pasted_secret(ui, id);
+                let resp = ui.add(egui::TextEdit::singleline(text).id(id).password(true));
+                super::secret_edit_menu(&resp, text);
+                if !resp.has_focus() && !egui::Popup::is_any_open(ui.ctx()) {
+                    resp.request_focus();
+                }
+            },
+            String::new(),
+        );
+        harness.run();
+        harness
+    }
+
+    #[test]
+    fn the_text_field_menu_works_inside_a_modal_dialog() {
+        // The dialogs are egui modals, which block layers under them: the menu must stay usable.
+        let mut harness = Harness::new_ui_state(
+            |ui, text: &mut String| {
+                egui::Modal::new(egui::Id::new("dialog")).show(ui.ctx(), |ui| {
+                    let resp = ui.add(egui::TextEdit::singleline(text));
+                    super::text_edit_menu(&resp, text);
+                });
+            },
+            "origin".to_owned(),
+        );
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click_secondary();
+        harness.run();
+        harness.get_by_label("Clear").click();
+        harness.run();
+        assert_eq!(harness.state(), "");
+    }
+
+    #[test]
+    fn a_pasted_token_loses_its_line_breaks_but_keeps_spaces() {
+        let mut harness = password_field();
+        harness.event(egui::Event::Paste("ghp_abc123\r\n".to_owned()));
+        harness.run();
+        assert_eq!(harness.state(), "ghp_abc123");
+
+        let mut harness = password_field();
+        harness.event(egui::Event::Paste("\n pass phrase \n".to_owned()));
+        harness.run();
+        assert_eq!(harness.state(), " pass phrase ");
+    }
+
+    #[test]
+    fn the_password_menu_never_copies() {
+        let mut harness = password_field();
+        harness.state_mut().push_str("secret");
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::PasswordInput)
+            .click_secondary();
+        harness.run();
+        assert!(harness.query_by_label("Copy").is_none());
+        assert!(harness.query_by_label("Cut").is_none());
+        harness.get_by_label("Clear").click();
+        harness.run();
+        assert_eq!(harness.state(), "");
     }
 }

@@ -280,18 +280,21 @@ impl DialogBody for BisectDialog {
                     .desired_width(f32::INFINITY)
                     .margin(egui::Margin::symmetric(8, 4)),
             );
+            super::widgets::text_edit_menu(&edit, &mut self.bad);
             if self.focus {
                 edit.request_focus();
                 self.focus = false;
             }
         });
         row(ui, t, "Good commit", |ui| {
-            ui.add(
+            let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.good)
                     .hint_text("A hash, tag or branch that worked (optional)")
                     .desired_width(f32::INFINITY)
                     .margin(egui::Margin::symmetric(8, 4)),
-            )
+            );
+            super::widgets::text_edit_menu(&edit, &mut self.good);
+            edit
         });
         ui.label(
             RichText::new(

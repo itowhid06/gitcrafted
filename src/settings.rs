@@ -326,12 +326,14 @@ impl Settings {
                 });
                 ui.end_row();
                 ui.label("Editor command");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.editor)
-                        .hint_text("code")
-                        .desired_width(200.0),
-                )
-                .on_hover_text("Run with a folder or file path, e.g. code, subl, idea");
+                let edit = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.editor)
+                            .hint_text("code")
+                            .desired_width(200.0),
+                    )
+                    .on_hover_text("Run with a folder or file path, e.g. code, subl, idea");
+                crate::repo::widgets::text_edit_menu(&edit, &mut self.editor);
                 ui.end_row();
             });
 
@@ -378,21 +380,18 @@ impl Settings {
         let mut remove = None;
         for (i, p) in self.profiles.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.label)
-                        .hint_text("Work")
-                        .desired_width(80.0),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.name)
-                        .hint_text("Name")
-                        .desired_width(140.0),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.email)
-                        .hint_text("email@example.com")
-                        .desired_width(190.0),
-                );
+                for (text, hint, width) in [
+                    (&mut p.label, "Work", 80.0),
+                    (&mut p.name, "Name", 140.0),
+                    (&mut p.email, "email@example.com", 190.0),
+                ] {
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(text)
+                            .hint_text(hint)
+                            .desired_width(width),
+                    );
+                    crate::repo::widgets::text_edit_menu(&edit, text);
+                }
                 if crate::icons::small_button(ui, "x", "Remove").clicked() {
                     remove = Some(i);
                 }

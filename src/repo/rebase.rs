@@ -362,11 +362,12 @@ impl RepoTab {
                         if e.step == Step::Reword {
                             ui.horizontal(|ui| {
                                 ui.add_space(70.0);
-                                ui.add(
+                                let edit = ui.add(
                                     egui::TextEdit::multiline(&mut e.message)
                                         .desired_rows(3)
                                         .desired_width((ui.available_width() - 16.0).max(120.0)),
                                 );
+                                super::widgets::text_edit_menu(&edit, &mut e.message);
                             });
                         }
                     });

@@ -114,12 +114,15 @@ impl DialogBody for MergeDialog {
         });
         ui.add_space(4.0);
         ui.add_enabled_ui(!self.squash && !self.no_commit, |ui| {
-            ui.add(
+            let summary = ui.add(
                 egui::TextEdit::singleline(&mut self.message)
                     .hint_text("Merge commit message (optional)")
                     .desired_width(f32::INFINITY)
                     .margin(egui::Margin::symmetric(8, 6)),
             );
+            if ui.is_enabled() {
+                widgets::text_edit_menu(&summary, &mut self.message);
+            }
         });
         ui.add_space(6.0);
         ui.checkbox(
@@ -199,6 +202,7 @@ impl DialogBody for StashDialog {
                 .desired_width(f32::INFINITY)
                 .margin(egui::Margin::symmetric(8, 6)),
         );
+        widgets::text_edit_menu(&edit, &mut self.message);
         if self.focus {
             edit.request_focus();
             self.focus = false;
@@ -676,7 +680,7 @@ impl DialogBody for TrackBranchDialog {
                     .desired_width((ui.available_width() - clear_w).max(80.0))
                     .margin(egui::Margin::symmetric(8, 5)),
             );
-            query_changed = edit.changed();
+            query_changed = widgets::text_edit_menu(&edit, &mut self.query) || edit.changed();
             if self.focus {
                 edit.request_focus();
                 self.focus = false;

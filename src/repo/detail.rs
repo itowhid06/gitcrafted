@@ -915,6 +915,10 @@ impl RepoTab {
                 .desired_rows(3)
                 .margin(egui::Margin::symmetric(8, 6)),
         );
+        if !rebasing {
+            widgets::text_edit_menu(&summary, &mut self.commit_summary);
+            widgets::text_edit_menu(&body, &mut self.commit_body);
+        }
         let len = self.commit_summary.chars().count();
         if !rebasing && len > 72 {
             ui.label(
@@ -1266,6 +1270,7 @@ fn reword_editor(ui: &mut Ui, reword: &mut Reword, allow_keys: bool) -> Option<b
             .hint_text("Summary")
             .desired_width(f32::INFINITY),
     );
+    widgets::text_edit_menu(&summary, &mut reword.subject);
     if reword.focus {
         summary.request_focus();
         reword.focus = false;
@@ -1277,6 +1282,7 @@ fn reword_editor(ui: &mut Ui, reword: &mut Reword, allow_keys: bool) -> Option<b
             .desired_rows(4)
             .desired_width(f32::INFINITY),
     );
+    widgets::text_edit_menu(&body, &mut reword.body);
     ui.add_space(6.0);
     let can_save = !reword.subject.trim().is_empty();
     let focused = summary.has_focus() || body.has_focus();

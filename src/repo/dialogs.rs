@@ -368,6 +368,7 @@ impl RepoTab {
                             .desired_width(f32::INFINITY)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
+                    widgets::text_edit_menu(&edit, name);
                     if *focus {
                         edit.request_focus();
                         *focus = false;
@@ -445,6 +446,7 @@ impl RepoTab {
                                 .desired_width(f32::INFINITY)
                                 .margin(egui::Margin::symmetric(8, 6)),
                         );
+                        widgets::text_edit_menu(&edit, new_name);
                         if *focus {
                             edit.request_focus();
                             *focus = false;
@@ -494,11 +496,14 @@ impl RepoTab {
                     ui.add_space(8.0);
                     ui.label(RichText::new("Folder").color(t.text_dim).small());
                     ui.horizontal(|ui| {
-                        let edit = ui.add(
+                        let mut edit = ui.add(
                             egui::TextEdit::singleline(path)
                                 .desired_width((ui.available_width() - 90.0).max(80.0))
                                 .margin(egui::Margin::symmetric(8, 6)),
                         );
+                        if widgets::text_edit_menu(&edit, path) {
+                            edit.mark_changed();
+                        }
                         if edit.changed() {
                             *path_edited = true;
                         }
@@ -574,13 +579,14 @@ impl RepoTab {
                         *name = name.replace(' ', "-");
                     }
                     ui.add_space(4.0);
-                    ui.add(
+                    let edit = ui.add(
                         egui::TextEdit::multiline(message)
                             .hint_text("Message (optional: makes an annotated tag)")
                             .desired_width(f32::INFINITY)
                             .desired_rows(2)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
+                    widgets::text_edit_menu(&edit, message);
                     if let Some(remote) = remote {
                         ui.add_space(4.0);
                         ui.checkbox(push, format!("Push it to {remote}"));
@@ -635,12 +641,13 @@ impl RepoTab {
                     title(ui, heading, "A name (like origin or upstream) and the repository's URL.", &t);
                     field(ui, name, "origin", focus);
                     ui.add_space(4.0);
-                    ui.add(
+                    let edit = ui.add(
                         egui::TextEdit::singleline(url)
                             .hint_text("https://github.com/user/repo.git")
                             .desired_width(f32::INFINITY)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
+                    widgets::text_edit_menu(&edit, url);
                     ui.add_space(8.0);
                     let url_t = url.trim();
                     let valid = idle && valid_ref_name(name) && !url_t.is_empty() && !url_t.starts_with('-');
@@ -708,12 +715,15 @@ impl RepoTab {
                         *path = super::submodules::folder_from_url(url);
                     }
                     ui.add_space(4.0);
-                    let edit = ui.add(
+                    let mut edit = ui.add(
                         egui::TextEdit::singleline(path)
                             .hint_text("libs/repo")
                             .desired_width(f32::INFINITY)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
+                    if widgets::text_edit_menu(&edit, path) {
+                        edit.mark_changed();
+                    }
                     if edit.changed() {
                         *path_edited = true;
                     }
@@ -747,13 +757,17 @@ impl RepoTab {
                     }
                     field(ui, username, "Username", focus);
                     ui.add_space(4.0);
-                    ui.add(
+                    let password_id = ui.make_persistent_id("credentials_password");
+                    widgets::trim_pasted_secret(ui, password_id);
+                    let edit = ui.add(
                         egui::TextEdit::singleline(password)
+                            .id(password_id)
                             .password(true)
                             .hint_text("Password or token")
                             .desired_width(f32::INFINITY)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
+                    widgets::secret_edit_menu(&edit, password);
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new("Used for this tab until you close it. If git has a credential helper (such as Git Credential Manager), it saves them once they work.")
@@ -773,16 +787,18 @@ impl RepoTab {
                     title(ui, &format!("Create {noun}"), &format!("{branch} → {base} (the branch is pushed first)"), &t);
                     field(ui, pr_title, "Title", focus);
                     ui.add_space(4.0);
-                    ui.add(
+                    let edit = ui.add(
                         egui::TextEdit::multiline(body)
                             .hint_text("Description")
                             .desired_width(f32::INFINITY)
                             .desired_rows(5)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
+                    widgets::text_edit_menu(&edit, body);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Into").color(t.text_dim));
-                        ui.add(egui::TextEdit::singleline(base).desired_width(160.0));
+                        let edit = ui.add(egui::TextEdit::singleline(base).desired_width(160.0));
+                        widgets::text_edit_menu(&edit, base);
                         ui.checkbox(draft, "Draft");
                     });
                     ui.add_space(8.0);
@@ -916,14 +932,19 @@ pub(super) fn title(ui: &mut egui::Ui, heading: &str, sub: &str, t: &Tokens) {
     ui.add_space(10.0);
 }
 
-/// A single-line field that takes the keyboard when the dialog opens.
+/// A single-line field that takes the keyboard when the dialog opens, with the usual
+/// right-click menu.
 fn field(ui: &mut egui::Ui, text: &mut String, hint: &str, focus: &mut bool) -> egui::Response {
-    let edit = ui.add(
+    let mut edit = ui.add(
         egui::TextEdit::singleline(text)
             .hint_text(hint)
             .desired_width(f32::INFINITY)
             .margin(egui::Margin::symmetric(8, 6)),
     );
+    // A menu entry that changes the text counts as an edit (fields derived from it follow).
+    if widgets::text_edit_menu(&edit, text) {
+        edit.mark_changed();
+    }
     if *focus {
         edit.request_focus();
         *focus = false;

@@ -1017,12 +1017,15 @@ impl App {
                 ui.label(RichText::new("Clone repository").font(theme::semibold(15.0)));
                 ui.add_space(10.0);
                 ui.label(RichText::new("URL").color(t.text_dim).small());
-                let url = ui.add(
+                let mut url = ui.add(
                     egui::TextEdit::singleline(&mut form.url)
                         .hint_text("https://github.com/user/repo.git")
                         .desired_width(f32::INFINITY)
                         .margin(egui::Margin::symmetric(8, 6)),
                 );
+                if crate::repo::widgets::text_edit_menu(&url, &mut form.url) {
+                    url.mark_changed();
+                }
                 if form.focus {
                     url.request_focus();
                     form.focus = false;
@@ -1033,11 +1036,12 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Into folder").color(t.text_dim).small());
                 ui.horizontal(|ui| {
-                    ui.add(
+                    let edit = ui.add(
                         egui::TextEdit::singleline(&mut form.parent)
                             .desired_width((ui.available_width() - 90.0).max(80.0))
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
+                    crate::repo::widgets::text_edit_menu(&edit, &mut form.parent);
                     if ui
                         .add(egui::Button::new("Browse…").min_size(vec2(80.0, 28.0)))
                         .clicked()
@@ -1047,14 +1051,12 @@ impl App {
                 });
                 ui.add_space(6.0);
                 ui.label(RichText::new("Name").color(t.text_dim).small());
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut form.name)
-                            .desired_width(f32::INFINITY)
-                            .margin(egui::Margin::symmetric(8, 6)),
-                    )
-                    .changed()
-                {
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut form.name)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(8, 6)),
+                );
+                if crate::repo::widgets::text_edit_menu(&name, &mut form.name) || name.changed() {
                     form.name_edited = true;
                 }
                 let trimmed_name = form.name.trim();
@@ -1077,19 +1079,24 @@ impl App {
                             .small(),
                     );
                     ui.add_space(4.0);
-                    ui.add(
+                    let edit = ui.add(
                         egui::TextEdit::singleline(&mut form.username)
                             .hint_text("Username")
                             .desired_width(f32::INFINITY)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
-                    ui.add(
+                    crate::repo::widgets::text_edit_menu(&edit, &mut form.username);
+                    let password_id = ui.make_persistent_id("clone_password");
+                    crate::repo::widgets::trim_pasted_secret(ui, password_id);
+                    let edit = ui.add(
                         egui::TextEdit::singleline(&mut form.password)
+                            .id(password_id)
                             .password(true)
                             .hint_text("Password or token")
                             .desired_width(f32::INFINITY)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
+                    crate::repo::widgets::secret_edit_menu(&edit, &mut form.password);
                 }
                 if !trimmed_name.is_empty() && !safe_name {
                     ui.colored_label(
@@ -1743,13 +1750,16 @@ impl App {
         let mut shown: Vec<usize> = Vec::new();
         let resp = modal.show(ctx, |ui| {
             ui.set_width(palette_w);
-            let edit = ui.add(
+            let mut edit = ui.add(
                 egui::TextEdit::singleline(&mut palette.query)
                     .hint_text("Type a command or a branch…")
                     .desired_width(f32::INFINITY)
                     .margin(egui::Margin::symmetric(10, 8))
                     .font(theme::medium(14.0)),
             );
+            if crate::repo::widgets::text_edit_menu(&edit, &mut palette.query) {
+                edit.mark_changed();
+            }
             if std::mem::take(&mut palette.focus) {
                 edit.request_focus();
             }
@@ -1905,11 +1915,15 @@ impl App {
                 ui.label(RichText::new(&request.prompt).color(t.text_dim));
                 ui.add_space(10.0);
                 if !confirm {
+                    let field_id = ui.make_persistent_id("askpass_answer");
+                    crate::repo::widgets::trim_pasted_secret(ui, field_id);
                     let field = ui.add(
                         egui::TextEdit::singleline(typed)
+                            .id(field_id)
                             .password(true)
                             .desired_width(f32::INFINITY),
                     );
+                    crate::repo::widgets::secret_edit_menu(&field, typed);
                     if !field.has_focus() {
                         field.request_focus();
                     }

@@ -640,11 +640,13 @@ impl Push {
             })
         });
         row(ui, t, "Remote branch", |ui| {
-            ui.add(
+            let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.remote_branch)
                     .desired_width(ui.available_width().max(80.0))
                     .margin(egui::Margin::symmetric(8, 4)),
-            )
+            );
+            super::widgets::text_edit_menu(&edit, &mut self.remote_branch);
+            edit
         });
         ui.add_space(6.0);
         ui.checkbox(&mut self.upstream, "Track the remote branch (set upstream)");

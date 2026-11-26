@@ -529,21 +529,25 @@ impl DialogBody for IssueDialog {
         });
         if self.kind == 2 {
             row(ui, t, "Prefix", |ui| {
-                ui.add(
+                let edit = ui.add(
                     egui::TextEdit::singleline(&mut self.prefix)
                         .hint_text("PROJ-")
                         .desired_width(f32::INFINITY)
                         .margin(egui::Margin::symmetric(8, 4)),
-                )
+                );
+                super::widgets::text_edit_menu(&edit, &mut self.prefix);
+                edit
             });
         }
         row(ui, t, "Link to", |ui| {
-            ui.add(
+            let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.url)
                     .hint_text("https://tracker.example.com/browse/{id}")
                     .desired_width(f32::INFINITY)
                     .margin(egui::Margin::symmetric(8, 4)),
-            )
+            );
+            super::widgets::text_edit_menu(&edit, &mut self.url);
+            edit
         });
         let url_trimmed = self.url.trim();
         let url_ok = is_safe_web_url(&url_trimmed.replace("{id}", "1"));

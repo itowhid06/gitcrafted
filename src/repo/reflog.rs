@@ -126,12 +126,13 @@ impl DialogBody for ReflogDialog {
             "Where HEAD has been. Pick an entry to find a commit again.",
             t,
         );
-        ui.add(
+        let edit = ui.add(
             egui::TextEdit::singleline(&mut self.filter)
                 .hint_text("Filter by message or hash")
                 .desired_width(f32::INFINITY)
                 .margin(egui::Margin::symmetric(8, 4)),
         );
+        super::widgets::text_edit_menu(&edit, &mut self.filter);
         ui.add_space(6.0);
         if let Some(e) = &self.error {
             ui.colored_label(t.danger, e);

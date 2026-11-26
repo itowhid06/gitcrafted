@@ -381,7 +381,7 @@ impl RepoTab {
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(8),
                         );
-                        if edit.changed() {
+                        if super::widgets::text_edit_menu(&edit, &mut ed.result) || edit.changed() {
                             ed.manual = true;
                         }
                     });
